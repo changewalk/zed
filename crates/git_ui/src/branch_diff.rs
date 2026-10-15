@@ -2,8 +2,9 @@ use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
-        render_send_review_to_agent_button,
+        self, ClearReviewOrder, CompareWithBranch, DeployBranchDiff, PostReviewToGitLab,
+        ProjectDiff, ReviewDiff, SuggestReviewOrder, render_post_review_to_gitlab_button,
+        render_review_order_button, render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
@@ -68,6 +69,12 @@ impl Addon for BranchDiffAddon {
     }
 }
 
+/// What a `zed://git/review` launch asks the branch diff to do once open.
+#[derive(Clone)]
+struct ReviewLaunch {
+    merge_request_file: Option<std::path::PathBuf>,
+}
+
 impl BranchDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(|workspace, _: &DeployBranchDiff, window, cx| {
@@ -79,6 +86,64 @@ impl BranchDiff {
 
     pub(crate) fn deploy_branch_diff(
         workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::deploy_branch_diff_impl(workspace, None, None, window, cx);
+    }
+
+    /// Opens the branch diff and asks the model for a review order as soon as
+    /// the files have loaded. Used by the `zed://git/review` URL. A `base_ref`
+    /// replaces the default branch, for a merge request stacked on another.
+    ///
+    /// The URL often arrives before the project has scanned its repository,
+    /// so this waits for one to appear before opening the diff.
+    pub fn deploy_for_review(
+        workspace: &mut Workspace,
+        base_ref: Option<SharedString>,
+        merge_request_file: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        const MAX_POLLS: usize = 120;
+
+        let project = workspace.project().clone();
+        let workspace = cx.entity();
+        let workspace_weak = workspace.downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                for poll in 0..MAX_POLLS {
+                    let deployed = workspace.update_in(cx, |workspace, window, cx| {
+                        if project.read(cx).active_repository(cx).is_none() {
+                            return false;
+                        }
+                        log::info!("review url: repository ready after {poll} polls");
+                        Self::deploy_branch_diff_impl(
+                            workspace,
+                            base_ref.clone(),
+                            Some(ReviewLaunch {
+                                merge_request_file: merge_request_file.clone(),
+                            }),
+                            window,
+                            cx,
+                        );
+                        true
+                    })?;
+                    if deployed {
+                        return Ok(());
+                    }
+                    cx.background_executor().timer(POLL_INTERVAL).await;
+                }
+                Err(anyhow!("No git repository was found in the project"))
+            })
+            .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn deploy_branch_diff_impl(
+        workspace: &mut Workspace,
+        base_ref_override: Option<SharedString>,
+        review: Option<ReviewLaunch>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -94,6 +159,22 @@ impl BranchDiff {
                 .detach_and_notify_err(workspace, window, cx);
             return;
         };
+
+        if let Some(base_ref) = base_ref_override {
+            // A stacked merge request's own base is not the shared default
+            // branch diff, so it gets a diff of its own.
+            Self::deploy_branch_diff_with_base_ref_impl(
+                workspace,
+                project,
+                intended_repo,
+                base_ref,
+                None,
+                review,
+                window,
+                cx,
+            );
+            return;
+        }
 
         let default_branch = intended_repo.update(cx, |repo, _| repo.default_branch(true));
         let workspace = cx.entity();
@@ -119,12 +200,13 @@ impl BranchDiff {
                         } else {
                             None
                         };
-                    Self::deploy_branch_diff_with_base_ref(
+                    Self::deploy_branch_diff_with_base_ref_impl(
                         workspace,
                         project,
                         intended_repo,
                         base_ref,
                         branch_diff,
+                        review,
                         window,
                         cx,
                     );
@@ -201,6 +283,28 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_branch_diff_with_base_ref_impl(
+            workspace,
+            project,
+            intended_repo,
+            base_ref,
+            branch_diff,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn deploy_branch_diff_with_base_ref_impl(
+        workspace: &mut Workspace,
+        project: Entity<Project>,
+        intended_repo: Entity<Repository>,
+        base_ref: SharedString,
+        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
+        review: Option<ReviewLaunch>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
             matches!(
@@ -215,6 +319,14 @@ impl BranchDiff {
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
+            if let Some(review) = review {
+                existing.update(cx, |item, cx| {
+                    item.diff.update(cx, |diff, cx| {
+                        diff.load_merge_request(review.merge_request_file, cx);
+                        diff.suggest_review_order_when_loaded(window, cx)
+                    })
+                });
+            }
             return;
         }
 
@@ -237,7 +349,21 @@ impl BranchDiff {
                     .await?;
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(this.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        if let Some(review) = review {
+                            this.update(cx, |item, cx| {
+                                item.diff.update(cx, |diff, cx| {
+                                    diff.load_merge_request(review.merge_request_file, cx);
+                                    diff.suggest_review_order_when_loaded(window, cx)
+                                })
+                            });
+                        }
                     })
                     .ok();
                 anyhow::Ok(())
@@ -429,6 +555,36 @@ impl BranchDiff {
                 }
             })
             .detach_and_notify_err(workspace, window, cx);
+    }
+
+    fn suggest_review_order(
+        &mut self,
+        _: &SuggestReviewOrder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.suggest_review_order(window, cx));
+    }
+
+    fn clear_review_order(
+        &mut self,
+        _: &ClearReviewOrder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.clear_review_order(window, cx));
+    }
+
+    fn post_review_to_gitlab(
+        &mut self,
+        _: &PostReviewToGitLab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -636,6 +792,9 @@ impl Render for BranchDiff {
         div()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
+            .on_action(cx.listener(Self::suggest_review_order))
+            .on_action(cx.listener(Self::clear_review_order))
+            .on_action(cx.listener(Self::post_review_to_gitlab))
             .child(self.diff.clone())
     }
 }
@@ -799,6 +958,8 @@ impl Render for BranchDiffToolbar {
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let review_order_button = show_review_button
+            .then(|| render_review_order_button(branch_diff.read(cx).diff.read(cx), &focus_handle));
 
         h_flex()
             .my_neg_1()
@@ -895,14 +1056,28 @@ impl Render for BranchDiffToolbar {
                         })),
                 )
             })
+            .when_some(review_order_button, |this, (button, action)| {
+                this.child(Divider::vertical())
+                    .child(button.on_click(cx.listener(move |this, _, window, cx| {
+                        this.dispatch_action(action.as_ref(), window, cx)
+                    })))
+            })
             .when(review_count > 0, |this| {
-                this.child(Divider::vertical()).child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
-                )
+                let posting = branch_diff.read(cx).diff.read(cx).is_posting_review();
+                this.child(Divider::vertical())
+                    .child(
+                        render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&SendReviewToAgent, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        render_post_review_to_gitlab_button(review_count, posting, &focus_handle)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&PostReviewToGitLab, window, cx)
+                            })),
+                    )
             })
     }
 }

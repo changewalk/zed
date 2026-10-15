@@ -7111,6 +7111,7 @@ dependencies = [
  "ui",
  "ui_input",
  "unindent",
+ "urlencoding",
  "util",
  "watch",
  "workspace",

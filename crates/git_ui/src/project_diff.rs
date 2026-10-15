@@ -1,10 +1,11 @@
 use crate::{
     branch_diff::BranchDiff,
-    diff_multibuffer::DiffMultibuffer,
+    diff_multibuffer::{DiffMultibuffer, ReviewOrderState},
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     staged_diff::StagedDiff,
     unstaged_diff::UnstagedDiff,
 };
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
 use editor::{
@@ -27,7 +28,7 @@ use project::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::GitDiffBaseSetting;
+use settings::{GitDiffBaseSetting, Settings as _};
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
@@ -57,6 +58,14 @@ actions!(
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
+        /// Asks the commit message model for the order to read the diff's
+        /// files in, then sorts the diff by it.
+        SuggestReviewOrder,
+        /// Sorts the diff by the git panel's order again.
+        ClearReviewOrder,
+        /// Posts the review comments as inline discussions on the open
+        /// GitLab merge request of the current branch, through `glab`.
+        PostReviewToGitLab,
     ]
 );
 
@@ -397,6 +406,22 @@ impl ProjectDiff {
     pub fn excerpt_file_paths(&self, cx: &App) -> Vec<String> {
         self.diff.read(cx).excerpt_file_paths(cx)
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_review_order(
+        &mut self,
+        order: Option<Arc<crate::review_order::ReviewOrder>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.set_review_order(order, window, cx));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn review_order_block_count(&self, cx: &App) -> usize {
+        self.diff.read(cx).review_order_block_count()
+    }
 }
 
 struct ButtonStates {
@@ -583,9 +608,46 @@ impl Item for ProjectDiff {
     }
 }
 
+impl ProjectDiff {
+    fn suggest_review_order(
+        &mut self,
+        _: &SuggestReviewOrder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.suggest_review_order(window, cx));
+    }
+
+    fn clear_review_order(
+        &mut self,
+        _: &ClearReviewOrder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.clear_review_order(window, cx));
+    }
+
+    fn post_review_to_gitlab(
+        &mut self,
+        _: &PostReviewToGitLab,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
+    }
+}
+
 impl Render for ProjectDiff {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.diff.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(cx.listener(Self::suggest_review_order))
+            .on_action(cx.listener(Self::clear_review_order))
+            .on_action(cx.listener(Self::post_review_to_gitlab))
+            .child(self.diff.clone())
     }
 }
 
@@ -820,6 +882,9 @@ impl Render for ProjectDiffToolbar {
 
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let is_multibuffer_empty = project_diff.read(cx).multibuffer(cx).read(cx).is_empty();
+        let review_order_button = (!is_multibuffer_empty
+            && AgentSettings::get_global(cx).enabled(cx))
+        .then(|| render_review_order_button(project_diff.read(cx).diff.read(cx), &focus_handle));
 
         let stage_all_button_width = rems(5.);
 
@@ -960,15 +1025,77 @@ impl Render for ProjectDiffToolbar {
                         this.dispatch_action(&Commit, window, cx);
                     })),
             )
-            .when(review_count > 0, |el| {
-                el.child(Divider::vertical()).child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
-                )
+            .when_some(review_order_button, |el, (button, action)| {
+                el.child(Divider::vertical())
+                    .child(button.on_click(cx.listener(move |this, _, window, cx| {
+                        this.dispatch_action(action.as_ref(), window, cx)
+                    })))
             })
+            .when(review_count > 0, |el| {
+                let posting = project_diff.read(cx).diff.read(cx).is_posting_review();
+                el.child(Divider::vertical())
+                    .child(
+                        render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&SendReviewToAgent, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        render_post_review_to_gitlab_button(review_count, posting, &focus_handle)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dispatch_action(&PostReviewToGitLab, window, cx)
+                            })),
+                    )
+            })
+    }
+}
+
+/// The toolbar button for the review order, with the action a click sends.
+///
+/// It reads "Suggest Review Order" until an order is set, then "Clear Review
+/// Order"; while the model is working it is disabled.
+pub(crate) fn render_review_order_button(
+    diff: &DiffMultibuffer,
+    focus_handle: &FocusHandle,
+) -> (Button, Box<dyn Action>) {
+    let icon = |name: IconName| Icon::new(name).size(IconSize::Small).color(Color::Muted);
+    match (diff.review_order_state(), diff.review_order()) {
+        (ReviewOrderState::Suggesting, _) => (
+            Button::new("review-order", "Ordering files…")
+                .start_icon(icon(IconName::ZedAssistant))
+                .disabled(true),
+            SuggestReviewOrder.boxed_clone(),
+        ),
+        (ReviewOrderState::WaitingForModel, _) => (
+            Button::new("review-order", "Waiting for a model…")
+                .start_icon(icon(IconName::ZedAssistant))
+                .disabled(true),
+            SuggestReviewOrder.boxed_clone(),
+        ),
+        (_, Some(order)) => (
+            Button::new(
+                "review-order",
+                format!("Clear Review Order ({})", order.len()),
+            )
+            .start_icon(icon(IconName::ListTree))
+            .tooltip(Tooltip::for_action_title_in(
+                "Sort the files by path again",
+                &ClearReviewOrder,
+                focus_handle,
+            )),
+            ClearReviewOrder.boxed_clone(),
+        ),
+        (_, None) => (
+            Button::new("review-order", "Suggest Review Order")
+                .start_icon(icon(IconName::ZedAssistant))
+                .tooltip(Tooltip::for_action_title_in(
+                    "Ask the model which order to read these files in",
+                    &SuggestReviewOrder,
+                    focus_handle,
+                )),
+            SuggestReviewOrder.boxed_clone(),
+        ),
     }
 }
 
@@ -990,6 +1117,31 @@ pub(crate) fn render_send_review_to_agent_button(
         &SendReviewToAgent,
         focus_handle,
     ))
+}
+
+/// The toolbar button that posts the review comments to the merge request.
+pub(crate) fn render_post_review_to_gitlab_button(
+    review_count: usize,
+    posting: bool,
+    focus_handle: &FocusHandle,
+) -> Button {
+    let label = if posting {
+        "Posting to GitLab…".to_string()
+    } else {
+        format!("Post Review to GitLab ({review_count})")
+    };
+    Button::new("post-review-gitlab", label)
+        .start_icon(
+            Icon::new(IconName::Gitlab)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .disabled(posting)
+        .tooltip(Tooltip::for_action_title_in(
+            "Post all review comments to the branch's open merge request",
+            &PostReviewToGitLab,
+            focus_handle,
+        ))
 }
 
 #[cfg(test)]
@@ -2258,6 +2410,90 @@ mod tests {
         // `src/foo.rs`.
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
         assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+    }
+
+    #[gpui::test]
+    async fn test_review_order_sorts_listed_files_first(cx: &mut TestAppContext) {
+        use crate::review_order::{ReviewNote, ReviewOrder, ReviewOrderEntry};
+        use git::repository::repo_path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.rs": "A\n",
+                "b.rs": "B\n",
+                "c.rs": "C\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("a.rs", "a\n".into()),
+                ("b.rs", "b\n".into()),
+                ("c.rs", "c\n".into()),
+            ],
+        );
+        cx.run_until_parked();
+        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+
+        // The order lists `c.rs` then `a.rs`; `b.rs` is left out, so it keeps
+        // its place after the listed files. `c.rs` has two notes, one past the
+        // end of the file, which still gets a block on the last line.
+        let order = ReviewOrder::new([
+            ReviewOrderEntry {
+                path: repo_path("c.rs"),
+                reason: "The main change.".into(),
+                notes: vec![
+                    ReviewNote {
+                        line: 1,
+                        text: "The new value.".into(),
+                    },
+                    ReviewNote {
+                        line: 99,
+                        text: "Past the end.".into(),
+                    },
+                ],
+            },
+            ReviewOrderEntry {
+                path: repo_path("a.rs"),
+                reason: "Tests it.".into(),
+                notes: Vec::new(),
+            },
+        ]);
+        diff.update_in(cx, |diff, window, cx| {
+            diff.set_review_order(Some(Arc::new(order)), window, cx)
+        });
+        cx.run_until_parked();
+        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
+        assert_eq!(paths, vec!["c.rs", "a.rs", "b.rs"]);
+        // Two file headers plus two notes.
+        let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
+        assert_eq!(blocks, 4);
+
+        // Clearing the order restores the path sort.
+        diff.update_in(cx, |diff, window, cx| {
+            diff.set_review_order(None, window, cx)
+        });
+        cx.run_until_parked();
+        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
+        assert_eq!(paths, vec!["a.rs", "b.rs", "c.rs"]);
+        let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
+        assert_eq!(blocks, 0);
     }
 
     #[gpui::test]

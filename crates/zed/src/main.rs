@@ -31,7 +31,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, QuitMode, SharedString, Task, TaskExt,
+    UpdateGlobal as _, block_on,
 };
 use gpui_platform;
 
@@ -1247,6 +1248,51 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                         cx,
                                     );
                                     Ok(())
+                                })
+                        })
+                        .log_err();
+
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+            OpenRequestKind::GitReview {
+                base_ref,
+                merge_request_file,
+            } => {
+                log::info!("review url: opening {:?}", request.open_paths);
+                let base_open_options = zed::open_options_for_request(
+                    request.open_behavior,
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    cx,
+                );
+                cx.spawn(async move |cx| {
+                    let paths_with_position =
+                        derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
+                    let (workspace, _results) = open_paths_with_positions(
+                        &paths_with_position,
+                        &[],
+                        false,
+                        app_state,
+                        base_open_options,
+                        cx,
+                    )
+                    .await?;
+
+                    workspace
+                        .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace
+                                .workspace()
+                                .clone()
+                                .update(cx, |workspace, cx| {
+                                    log::info!("review url: workspace open, deploying branch diff");
+                                    git_ui::branch_diff::BranchDiff::deploy_for_review(
+                                        workspace,
+                                        base_ref.map(SharedString::from),
+                                        merge_request_file.map(PathBuf::from),
+                                        window,
+                                        cx,
+                                    );
                                 })
                         })
                         .log_err();

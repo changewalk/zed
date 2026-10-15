@@ -80,6 +80,16 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    /// Opens the branch diff of the repository in `open_paths` and asks the
+    /// model for a review order once the files have loaded.
+    GitReview {
+        /// The ref to diff against instead of the default branch, for a
+        /// merge request stacked on another branch.
+        base_ref: Option<String>,
+        /// A JSON file with the merge request, written by the launcher so the
+        /// editor does not fetch it again.
+        merge_request_file: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -118,6 +128,14 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::GitReview {
+                base_ref,
+                merge_request_file,
+            } => f
+                .debug_struct("GitReview")
+                .field("base_ref", base_ref)
+                .field("merge_request_file", merge_request_file)
+                .finish(),
         }
     }
 }
@@ -192,6 +210,8 @@ impl OpenRequest {
                 this.parse_git_clone_url(clone_path)?
             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
+            } else if let Some(review_path) = url.strip_prefix("zed://git/review") {
+                this.parse_git_review_url(review_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
@@ -277,6 +297,37 @@ impl OpenRequest {
 
         self.kind = Some(OpenRequestKind::GitCommit {
             sha: sha.to_string(),
+        });
+
+        Ok(())
+    }
+
+    fn parse_git_review_url(&mut self, review_path: &str) -> Result<()> {
+        // Format: [/]?repo=<path>[&base=<ref>]
+        let query = review_path
+            .trim_start_matches('/')
+            .strip_prefix('?')
+            .context("invalid git review url: missing query string")?;
+
+        let mut repo = None;
+        let mut base_ref = None;
+        let mut merge_request_file = None;
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match &*key {
+                "repo" => repo = Some(value.to_string()),
+                "base" => base_ref = Some(value.to_string()),
+                "mr" => merge_request_file = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        let repo = repo
+            .filter(|s| !s.is_empty())
+            .context("invalid git review url: missing repo query parameter")?;
+
+        self.open_paths.push(repo);
+        self.kind = Some(OpenRequestKind::GitReview {
+            base_ref: base_ref.filter(|s| !s.is_empty()),
+            merge_request_file: merge_request_file.filter(|s| !s.is_empty()),
         });
 
         Ok(())
@@ -1656,6 +1707,72 @@ mod tests {
                 assert_eq!(external_source_prompt, None);
             }
             _ => panic!("Expected AgentPanel kind"),
+        }
+    }
+
+    #[gpui::test]
+    fn test_parse_git_review_url(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+
+        for url in [
+            "zed://git/review?repo=path%20with%20spaces",
+            "zed://git/review/?repo=path%20with%20spaces",
+        ] {
+            let request = cx.update(|cx| {
+                OpenRequest::parse(
+                    RawOpenRequest {
+                        urls: vec![url.into()],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .unwrap()
+            });
+            assert!(matches!(
+                request.kind,
+                Some(OpenRequestKind::GitReview {
+                    base_ref: None,
+                    merge_request_file: None
+                })
+            ));
+            assert_eq!(request.open_paths, vec!["path with spaces"]);
+        }
+
+        let request = cx.update(|cx| {
+            OpenRequest::parse(
+                RawOpenRequest {
+                    urls: vec![
+                        "zed://git/review?repo=r&base=origin%2Ffeature%2Fbase&mr=%2Ftmp%2Fmr.json"
+                            .into(),
+                    ],
+                    ..Default::default()
+                },
+                cx,
+            )
+            .unwrap()
+        });
+        match request.kind {
+            Some(OpenRequestKind::GitReview {
+                base_ref,
+                merge_request_file,
+            }) => {
+                assert_eq!(base_ref.as_deref(), Some("origin/feature/base"));
+                assert_eq!(merge_request_file.as_deref(), Some("/tmp/mr.json"));
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+
+        for url in ["zed://git/review", "zed://git/review?repo="] {
+            let result = cx.update(|cx| {
+                OpenRequest::parse(
+                    RawOpenRequest {
+                        urls: vec![url.into()],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            assert!(result.is_err(), "{url} should be rejected");
         }
     }
 

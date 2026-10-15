@@ -225,6 +225,16 @@ impl StoredReviewComment {
     }
 }
 
+/// A stored review comment, with what a caller needs to post it elsewhere.
+#[derive(Clone, Debug)]
+pub struct ReviewCommentSnapshot {
+    pub id: usize,
+    /// The file path, relative to the worktree.
+    pub file_path: Arc<util::rel_path::RelPath>,
+    pub range: Range<Anchor>,
+    pub text: String,
+}
+
 impl Editor {
     pub fn diff_hunks_in_ranges<'a>(
         &'a self,
@@ -753,6 +763,21 @@ impl Editor {
             .sum()
     }
 
+    /// Every stored review comment, in the order they were added within each hunk.
+    pub fn review_comments(&self) -> Vec<ReviewCommentSnapshot> {
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(key, comments)| {
+                comments.iter().map(|comment| ReviewCommentSnapshot {
+                    id: comment.id,
+                    file_path: key.file_path.clone(),
+                    range: comment.range.clone(),
+                    text: comment.comment.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Adds a new review comment to a specific hunk.
     pub(super) fn add_review_comment(
         &mut self,
@@ -1164,7 +1189,7 @@ impl Editor {
     }
 
     /// Removes a review comment by ID from any hunk.
-    pub(super) fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
+    pub fn remove_review_comment(&mut self, id: usize, cx: &mut Context<Self>) -> bool {
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(index) = comments.iter().position(|c| c.id == id) {
                 comments.remove(index);

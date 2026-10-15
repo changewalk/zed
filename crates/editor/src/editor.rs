@@ -111,6 +111,7 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
+pub use git::ReviewCommentSnapshot;
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
