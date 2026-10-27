@@ -75,6 +75,38 @@ impl ReviewOrder {
         self.position_by_path.get(path).copied()
     }
 
+    /// The same order with `pinned` files first, in their given order, and
+    /// the rest following in this order. A pinned reason replaces the
+    /// model's unless it is empty.
+    pub fn with_pinned_first(&self, pinned: &[ReviewOrderEntry]) -> Self {
+        let mut entries: Vec<ReviewOrderEntry> = pinned
+            .iter()
+            .map(|pin| {
+                let model_entry = self.position(&pin.path).map(|index| &self.entries[index]);
+                ReviewOrderEntry {
+                    path: pin.path.clone(),
+                    reason: if pin.reason.is_empty() {
+                        model_entry
+                            .map(|entry| entry.reason.clone())
+                            .unwrap_or_default()
+                    } else {
+                        pin.reason.clone()
+                    },
+                    notes: model_entry
+                        .map(|entry| entry.notes.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        entries.extend(
+            self.entries
+                .iter()
+                .filter(|entry| !pinned.iter().any(|pin| pin.path == entry.path))
+                .cloned(),
+        );
+        Self::new(entries)
+    }
+
     /// The same order with each file's notes replaced by `notes`. Files
     /// without an entry in `notes` lose theirs.
     pub fn with_notes(&self, mut notes: ReviewNotes) -> Self {
@@ -88,6 +120,149 @@ impl ReviewOrder {
 
 /// Guiding notes keyed by the file they belong to.
 pub type ReviewNotes = HashMap<RepoPath, Vec<ReviewNote>>;
+
+/// The order the author asks for in the merge request's description, when
+/// it has a "review order" or "reading order" part naming files of the
+/// diff, with the author's reasons. The files are matched among `known`
+/// by full path, by unique suffix, or by a `…` in the middle.
+pub(crate) fn order_from_description(
+    description: &str,
+    known: &[RepoPath],
+) -> Vec<ReviewOrderEntry> {
+    let Some(section) = order_section(description) else {
+        return Vec::new();
+    };
+    // Each backtick token that names a file starts an entry; the text up to
+    // the next such token is the author's reason for it.
+    let mut entries: Vec<ReviewOrderEntry> = Vec::new();
+    let mut reason = String::new();
+    let mut rest = section;
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('`') else {
+            break;
+        };
+        let token = &after[..end];
+        let between = &rest[..start];
+        match resolve_path(token, known) {
+            Some(path) if !entries.iter().any(|entry| entry.path == path) => {
+                if let Some(last) = entries.last_mut() {
+                    reason.push_str(between);
+                    last.reason = clean_reason(&reason).into();
+                }
+                reason.clear();
+                entries.push(ReviewOrderEntry {
+                    path,
+                    reason: SharedString::default(),
+                    notes: Vec::new(),
+                });
+            }
+            _ => {
+                reason.push_str(between);
+                reason.push_str(token);
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    if let Some(last) = entries.last_mut() {
+        reason.push_str(rest);
+        last.reason = clean_reason(&reason).into();
+    }
+    entries
+}
+
+/// The part of `description` that gives the order: from the words "review
+/// order" or "reading order" to the end of that paragraph or list.
+fn order_section(description: &str) -> Option<&str> {
+    let lower = description.to_ascii_lowercase();
+    let start = [
+        "review order",
+        "reading order",
+        "read in this order",
+        "suggested order",
+    ]
+    .iter()
+    .filter_map(|phrase| lower.find(phrase))
+    .min()?;
+    let section = &description[start..];
+    // A paragraph ends at a blank line. A heading such as "## Review order"
+    // names no file itself, so the blank line after it does not end the
+    // section; the list below it does.
+    let mut end = section.len();
+    let mut seen_text_line = false;
+    let mut offset = 0;
+    for line in section.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if seen_text_line {
+                end = offset;
+                break;
+            }
+        } else if offset > 0 && trimmed.starts_with('#') {
+            end = offset;
+            break;
+        } else if offset > 0 || trimmed.contains('`') {
+            seen_text_line = true;
+        }
+        offset += line.len();
+    }
+    Some(&section[..end])
+}
+
+/// The file of the diff that `token` names, if exactly one does.
+fn resolve_path(token: &str, known: &[RepoPath]) -> Option<RepoPath> {
+    let token = token.trim().trim_start_matches("./");
+    if token.is_empty() || !token.contains('.') {
+        return None;
+    }
+    let matches: Vec<&RepoPath> = if let Some((prefix, suffix)) = token.split_once("...") {
+        known
+            .iter()
+            .filter(|path| {
+                let path = path.as_unix_str();
+                path.starts_with(prefix.trim_end_matches('/'))
+                    && path.ends_with(suffix.trim_start_matches('/'))
+            })
+            .collect()
+    } else {
+        let exact: Vec<&RepoPath> = known
+            .iter()
+            .filter(|path| path.as_unix_str() == token)
+            .collect();
+        if !exact.is_empty() {
+            exact
+        } else {
+            known
+                .iter()
+                .filter(|path| {
+                    let path = path.as_unix_str();
+                    path.ends_with(token) && path[..path.len() - token.len()].ends_with('/')
+                })
+                .collect()
+        }
+    };
+    match matches.as_slice() {
+        [path] => Some((*path).clone()),
+        _ => None,
+    }
+}
+
+/// The author's words for a file, without the arrows and brackets that
+/// joined the list, capped at a sentence.
+fn clean_reason(text: &str) -> String {
+    let joined = text.replace('→', " ").replace("->", " ");
+    let joined = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = joined
+        .trim_matches(|c: char| c.is_whitespace() || "(),.:;-–".contains(c))
+        .to_string();
+    const MAX_CHARS: usize = 100;
+    if cleaned.chars().count() > MAX_CHARS {
+        let cut: String = cleaned.chars().take(MAX_CHARS).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        cleaned
+    }
+}
 
 /// What the prompts tell the model about one changed file.
 pub(crate) struct ReviewOrderFile {
@@ -110,10 +285,15 @@ pub(crate) const MAX_EXCERPT_BYTES_PER_FILE: usize = 6_000;
 /// The most bytes of changed lines sent in the whole notes prompt.
 pub(crate) const MAX_EXCERPT_BYTES_TOTAL: usize = 60_000;
 
+/// The most bytes of merge request description or issue text put in a prompt.
+const MAX_CONTEXT_BYTES: usize = 6_000;
+
 /// The prompt that asks for the reading order, kept small so it answers fast.
-pub(crate) fn build_order_prompt(files: &[ReviewOrderFile], instructions: Option<&str>) -> String {
+/// `context` describes the merge request: its title, description, and the
+/// issues it is for.
+pub(crate) fn build_order_prompt(files: &[ReviewOrderFile], context: Option<&str>) -> String {
     let mut prompt = include_str!("review_order_prompt.txt").to_string();
-    append_instructions(&mut prompt, instructions);
+    append_context(&mut prompt, context);
     append_files(
         &mut prompt,
         files,
@@ -125,9 +305,9 @@ pub(crate) fn build_order_prompt(files: &[ReviewOrderFile], instructions: Option
 
 /// The prompt that asks for guiding notes, with as much of each file as the
 /// budget allows.
-pub(crate) fn build_notes_prompt(files: &[ReviewOrderFile], instructions: Option<&str>) -> String {
+pub(crate) fn build_notes_prompt(files: &[ReviewOrderFile], context: Option<&str>) -> String {
     let mut prompt = include_str!("review_notes_prompt.txt").to_string();
-    append_instructions(&mut prompt, instructions);
+    append_context(&mut prompt, context);
     append_files(
         &mut prompt,
         files,
@@ -137,13 +317,73 @@ pub(crate) fn build_notes_prompt(files: &[ReviewOrderFile], instructions: Option
     prompt
 }
 
-fn append_instructions(prompt: &mut String, instructions: Option<&str>) {
-    if let Some(instructions) = instructions.map(str::trim).filter(|s| !s.is_empty()) {
-        write!(
+/// One of the reviewer's comments, for the summary prompt.
+pub(crate) struct SummaryComment {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+}
+
+/// The prompt that asks for a summary comment on the merge request, drawn
+/// from the reviewer's inline comments.
+pub(crate) fn build_summary_prompt(context: Option<&str>, comments: &[SummaryComment]) -> String {
+    let mut prompt = include_str!("review_summary_prompt.txt").to_string();
+    append_context(&mut prompt, context);
+    writeln!(
+        prompt,
+        "\nThe reviewer's inline comments ({}):",
+        comments.len()
+    )
+    .ok();
+    for comment in comments {
+        writeln!(
             prompt,
-            "\nExtra instructions from the reviewer:\n{instructions}\n"
+            "\n{}:{}\n{}",
+            comment.path,
+            comment.line,
+            comment.text.trim()
         )
         .ok();
+    }
+    prompt
+}
+
+/// One note of a thread, for the reply prompt.
+pub(crate) struct ThreadNote {
+    pub author: String,
+    pub body: String,
+}
+
+/// The prompt that asks for a reply to a thread, given the code it is on
+/// and what has been said so far. `own_name` is how the reviewer appears
+/// in the thread, so the model knows which side it writes for.
+pub(crate) fn build_reply_prompt(
+    context: Option<&str>,
+    path: &str,
+    code: &str,
+    notes: &[ThreadNote],
+    own_name: &str,
+) -> String {
+    let mut prompt = include_str!("review_reply_prompt.txt").to_string();
+    append_context(&mut prompt, context);
+    writeln!(prompt, "\nYou write as {own_name}.").ok();
+    writeln!(
+        prompt,
+        "\nThe code the thread is on, in {path}:\n```\n{}\n```",
+        code.trim_end()
+    )
+    .ok();
+    writeln!(prompt, "\nThe thread so far:").ok();
+    for note in notes {
+        writeln!(prompt, "\n{}:\n{}", note.author, note.body.trim()).ok();
+    }
+    prompt
+}
+
+fn append_context(prompt: &mut String, context: Option<&str>) {
+    if let Some(context) = context.map(str::trim).filter(|context| !context.is_empty()) {
+        let context = truncate_to_lines(context, MAX_CONTEXT_BYTES);
+        write!(prompt, "\nAbout the merge request:\n{context}\n").ok();
     }
 }
 
@@ -287,6 +527,74 @@ pub(crate) fn parse_review_notes(text: &str, known_paths: &[RepoPath]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_description_order_pins_its_files_first_with_the_authors_reasons() {
+        let known: Vec<RepoPath> = [
+            "docs/adrs/side-effects-run-on-temporal.md",
+            "backend/src/app/temporal.py",
+            "backend/src/app/modules/index/side_effects.py",
+            "backend/src/app/modules/workspaces/side_effects.py",
+            "helm/app/templates/seed-job.yaml",
+            "backend/tests/support.py",
+            "backend/src/app/worker.py",
+        ]
+        .iter()
+        .map(|path| RepoPath::new(path).unwrap())
+        .collect();
+        let description = "Some intro.\n\n**Review order:** `docs/adrs/side-effects-run-on-temporal.md` (the decision) → `backend/src/app/temporal.py` (`RunActivity`, `defer_activity`) → `index/side_effects.py` (the shape every module repeats) → `helm/.../seed-job.yaml` → the tests (`tests/support.py` `eventually` first).\n\nMore text with `worker.py` later.";
+
+        let pinned = order_from_description(description, &known);
+        let pinned_paths: Vec<&str> = pinned.iter().map(|e| e.path.as_unix_str()).collect();
+        assert_eq!(
+            pinned_paths,
+            vec![
+                "docs/adrs/side-effects-run-on-temporal.md",
+                "backend/src/app/temporal.py",
+                "backend/src/app/modules/index/side_effects.py",
+                "helm/app/templates/seed-job.yaml",
+                "backend/tests/support.py",
+            ]
+        );
+        assert_eq!(pinned[0].reason.as_ref(), "the decision");
+        assert_eq!(pinned[1].reason.as_ref(), "RunActivity, defer_activity");
+        assert_eq!(pinned[2].reason.as_ref(), "the shape every module repeats");
+        assert_eq!(pinned[3].reason.as_ref(), "the tests");
+        assert_eq!(pinned[4].reason.as_ref(), "eventually first");
+
+        let model_order = ReviewOrder::new(known.iter().rev().map(|path| ReviewOrderEntry {
+            path: path.clone(),
+            reason: "model".into(),
+            notes: Vec::new(),
+        }));
+        let combined = model_order.with_pinned_first(&pinned);
+        let paths: Vec<&str> = combined
+            .entries()
+            .iter()
+            .map(|e| e.path.as_unix_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "docs/adrs/side-effects-run-on-temporal.md",
+                "backend/src/app/temporal.py",
+                "backend/src/app/modules/index/side_effects.py",
+                "helm/app/templates/seed-job.yaml",
+                "backend/tests/support.py",
+                "backend/src/app/worker.py",
+                "backend/src/app/modules/workspaces/side_effects.py",
+            ]
+        );
+        assert_eq!(combined.entries()[0].reason.as_ref(), "the decision");
+        assert_eq!(combined.entries()[5].reason.as_ref(), "model");
+    }
+
+    #[test]
+    fn a_description_without_an_order_pins_nothing() {
+        let known = vec![RepoPath::new("a.rs").unwrap()];
+        assert!(order_from_description("Just `a.rs` changed.", &known).is_empty());
+        assert!(order_from_description("", &known).is_empty());
+    }
     use git::repository::repo_path;
 
     #[test]

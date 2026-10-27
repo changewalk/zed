@@ -3,7 +3,8 @@ You help a code reviewer read a diff in the best order.
 Below is a list of the changed files, with their git status, line counts, and the first changed lines of each. Put the files in the order a careful reviewer should read them.
 
 Rules for the order:
-- Start with the file that carries the main behaviour change, the one every other file depends on.
+- Start with the file that carries the main behaviour change, the one every other file depends on. The merge request's description, when given, says which change that is.
+- When the description gives a review or reading order, follow it for the files it names and fit the other files around them.
 - Follow the dependencies: a caller after the function it calls, a test after the code it tests.
 - Put evidence next: tests, fixtures, and eval outputs.
 - End with files a reviewer can skim: generated code, lock files, formatting, renames, and config.

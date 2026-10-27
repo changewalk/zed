@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, AskAboutBranchDiff, ConflictContent, LogoutAgent, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -568,6 +568,61 @@ pub fn init(cx: &mut App) {
                             }),
                             true,
                             AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .register_action(|workspace, action: &AskAboutBranchDiff, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+
+                    let mention_uri = MentionUri::GitDiff {
+                        base_ref: action.base_ref.to_string(),
+                    };
+                    let diff_uri = mention_uri.to_uri().to_string();
+
+                    // The context and the diff go as a first message that asks
+                    // for nothing but a line of acknowledgement, so the
+                    // thread is warm and the box is empty for the question.
+                    let content_blocks = vec![
+                        acp_v2::ContentBlock::Text(acp_v2::TextContent::new(format!(
+                            "I am going to ask you questions about this change as I read \
+                             it. Read the context and the diff below and keep them in \
+                             mind. Do not review the change, do not list findings, \
+                             issues, or suggestions, and do not ask what I want. Reply \
+                             with one sentence saying what the change does, then wait \
+                             for my questions.\n\n{}\n\n",
+                            action.context.trim()
+                        ))),
+                        acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+                            acp_v2::EmbeddedResourceResource::TextResourceContents(
+                                acp_v2::TextResourceContents::new(
+                                    action.diff_text.to_string(),
+                                    diff_uri,
+                                ),
+                            ),
+                        )),
+                    ];
+
+                    if action.focus {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+
+                    let focus = action.focus;
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: content_blocks,
+                                auto_submit: true,
+                            }),
+                            focus,
+                            AgentThreadSource::ReviewPrimer,
                             window,
                             cx,
                         );

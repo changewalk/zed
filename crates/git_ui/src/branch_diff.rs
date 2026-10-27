@@ -2,15 +2,17 @@ use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
-        self, ClearReviewOrder, CompareWithBranch, DeployBranchDiff, PostReviewToGitLab,
-        ProjectDiff, ReviewDiff, SuggestReviewOrder, render_post_review_to_gitlab_button,
+        self, ApproveMergeRequest, AskAboutDiff, ClearReviewOrder, CompareWithBranch,
+        DeployBranchDiff, FinishReview, MarkReviewed, PostReviewToGitLab, ProjectDiff,
+        RefreshReviewThreads, ReviewDiff, SuggestReviewOrder, ToggleChangesSinceReview,
+        ToggleMergeRequestDescription, render_post_review_to_gitlab_button, render_review_buttons,
         render_review_order_button, render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use editor::{
-    Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
+    Addon, Editor, EditorEvent, HiddenUnstagedDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
 use git::{repository::DiffType, status::FileStatus};
@@ -33,13 +35,13 @@ use std::{
 };
 use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
-    ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
+    CloseInactiveTabsAndPanes, ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent,
+    ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{Item, ItemEvent, SaveOptions},
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
-use zed_actions::agent::ReviewBranchDiff;
+use zed_actions::agent::{AskAboutBranchDiff, ReviewBranchDiff};
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
@@ -51,6 +53,10 @@ pub struct BranchDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     _diff_event_subscription: Subscription,
+    /// A thread primed with this diff exists in the agent panel, so Ask
+    /// only needs to show it.
+    ask_thread_prepared: bool,
+    _prepare_ask_thread_task: Option<Task<()>>,
 }
 
 struct BranchDiffAddon {
@@ -274,6 +280,23 @@ impl BranchDiff {
         });
     }
 
+    /// A review launch opens a workspace that may restore the tabs of an
+    /// earlier session, which are noise next to the diff. Anything unsaved
+    /// still asks before closing.
+    fn close_other_tabs(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        workspace.close_inactive_items_and_panes(
+            &CloseInactiveTabsAndPanes {
+                save_intent: Some(workspace::SaveIntent::Close),
+            },
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn deploy_branch_diff_with_base_ref(
         workspace: &mut Workspace,
         project: Entity<Project>,
@@ -324,8 +347,10 @@ impl BranchDiff {
                     item.diff.update(cx, |diff, cx| {
                         diff.load_merge_request(review.merge_request_file, cx);
                         diff.suggest_review_order_when_loaded(window, cx)
-                    })
+                    });
+                    item.prepare_ask_thread_when_ordered(window, cx);
                 });
+                Self::close_other_tabs(workspace, window, cx);
             }
             return;
         }
@@ -361,8 +386,10 @@ impl BranchDiff {
                                 item.diff.update(cx, |diff, cx| {
                                     diff.load_merge_request(review.merge_request_file, cx);
                                     diff.suggest_review_order_when_loaded(window, cx)
-                                })
+                                });
+                                item.prepare_ask_thread_when_ordered(window, cx);
                             });
+                            Self::close_other_tabs(workspace, window, cx);
                         }
                     })
                     .ok();
@@ -464,7 +491,11 @@ impl BranchDiff {
                 Capability::ReadWrite,
                 "No changes",
                 move |editor, cx| {
-                    editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
+                    // A branch's changes are all committed, so by the staged
+                    // rule every hunk would draw hollow; a reviewer wants
+                    // them filled, as the uncommitted diff draws them.
+                    editor
+                        .set_diff_hunk_renderer(Some(Arc::new(HiddenUnstagedDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, _cx| {
                         rhs_editor.set_read_only(false);
                         rhs_editor.register_addon(BranchDiffAddon {
@@ -495,6 +526,8 @@ impl BranchDiff {
             project,
             workspace: workspace.downgrade(),
             _diff_event_subscription: diff_event_subscription,
+            ask_thread_prepared: false,
+            _prepare_ask_thread_task: None,
         }
     }
 
@@ -557,6 +590,95 @@ impl BranchDiff {
             .detach_and_notify_err(workspace, window, cx);
     }
 
+    /// Shows the thread primed with this diff, or primes one now if none
+    /// was prepared in the background.
+    fn ask_about_diff(&mut self, _: &AskAboutDiff, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ask_thread_prepared {
+            window.dispatch_action(zed_actions::assistant::ToggleFocus.boxed_clone(), cx);
+            return;
+        }
+        self.prepare_ask_thread(true, window, cx);
+    }
+
+    /// Primes the thread once the review order is in, so the context it
+    /// carries is complete, or after a while if no order comes.
+    fn prepare_ask_thread_when_ordered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const MAX_POLLS: usize = 240;
+
+        if self.ask_thread_prepared || self._prepare_ask_thread_task.is_some() {
+            return;
+        }
+        self._prepare_ask_thread_task = Some(cx.spawn_in(window, async move |this, cx| {
+            for _ in 0..MAX_POLLS {
+                let ordered = this.update(cx, |this, cx| {
+                    this.diff.read(cx).review_order().is_some()
+                        || matches!(
+                            this.diff.read(cx).review_order_state(),
+                            crate::diff_multibuffer::ReviewOrderState::Failed(_)
+                        )
+                });
+                match ordered {
+                    Ok(true) => break,
+                    Ok(false) => cx.background_executor().timer(POLL_INTERVAL).await,
+                    Err(_) => return,
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                if !this.ask_thread_prepared {
+                    this.prepare_ask_thread(false, window, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Opens a thread primed with the diff and what is known about the merge
+    /// request, told to read rather than review, so questions can start at
+    /// once. With `focus` the panel is shown; without, it is left as it is.
+    fn prepare_ask_thread(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
+            return;
+        };
+        let Some(repo) = self.repo(cx) else {
+            return;
+        };
+        self.ask_thread_prepared = true;
+        let context: SharedString = self.diff.read(cx).ask_context().into();
+        let diff_receiver = repo.update(cx, |repo, cx| {
+            repo.diff(
+                DiffType::MergeBase {
+                    base_ref: base_ref.clone(),
+                },
+                cx,
+            )
+        });
+        let workspace = self.workspace.clone();
+        window
+            .spawn(cx, {
+                let workspace = workspace.clone();
+                async move |cx| {
+                    let diff_text = diff_receiver.await??;
+                    if let Some(workspace) = workspace.upgrade() {
+                        workspace.update_in(cx, |_workspace, window, cx| {
+                            window.dispatch_action(
+                                AskAboutBranchDiff {
+                                    diff_text: diff_text.into(),
+                                    base_ref,
+                                    context,
+                                    focus,
+                                }
+                                .boxed_clone(),
+                                cx,
+                            );
+                        })?;
+                    }
+                    anyhow::Ok(())
+                }
+            })
+            .detach_and_notify_err(workspace, window, cx);
+    }
+
     fn suggest_review_order(
         &mut self,
         _: &SuggestReviewOrder,
@@ -580,11 +702,61 @@ impl BranchDiff {
     fn post_review_to_gitlab(
         &mut self,
         _: &PostReviewToGitLab,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.diff
-            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
+            .update(cx, |diff, cx| diff.post_review_to_gitlab(window, cx));
+    }
+
+    fn refresh_review_threads(
+        &mut self,
+        _: &RefreshReviewThreads,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.sync_review_threads(window, cx));
+    }
+
+    fn finish_review(&mut self, _: &FinishReview, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_review_summary(window, cx));
+    }
+
+    fn approve_merge_request(
+        &mut self,
+        _: &ApproveMergeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            diff.finish_review(crate::diff_multibuffer::ReviewVerdict::Approve, window, cx)
+        });
+    }
+
+    fn mark_reviewed(&mut self, _: &MarkReviewed, _: &mut Window, cx: &mut Context<Self>) {
+        self.diff.update(cx, |diff, cx| diff.mark_reviewed(cx));
+    }
+
+    fn toggle_merge_request_description(
+        &mut self,
+        _: &ToggleMergeRequestDescription,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
+    }
+
+    fn toggle_changes_since_review(
+        &mut self,
+        _: &ToggleChangesSinceReview,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_changes_since_review(cx));
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -792,9 +964,16 @@ impl Render for BranchDiff {
         div()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
+            .on_action(cx.listener(Self::ask_about_diff))
             .on_action(cx.listener(Self::suggest_review_order))
             .on_action(cx.listener(Self::clear_review_order))
             .on_action(cx.listener(Self::post_review_to_gitlab))
+            .on_action(cx.listener(Self::refresh_review_threads))
+            .on_action(cx.listener(Self::finish_review))
+            .on_action(cx.listener(Self::approve_merge_request))
+            .on_action(cx.listener(Self::mark_reviewed))
+            .on_action(cx.listener(Self::toggle_merge_request_description))
+            .on_action(cx.listener(Self::toggle_changes_since_review))
             .child(self.diff.clone())
     }
 }
@@ -922,7 +1101,7 @@ impl Render for BranchDiffToolbar {
             .read(cx)
             .diff
             .read(cx)
-            .total_review_comment_count();
+            .unposted_review_comment_count(cx);
         let (additions, deletions) = branch_diff
             .read(cx)
             .diff
@@ -1036,7 +1215,7 @@ impl Render for BranchDiffToolbar {
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
-                    Button::new("review-diff", "Review Diff")
+                    Button::new("ask-about-diff", "Ask")
                         .start_icon(
                             Icon::new(IconName::ZedAssistant)
                                 .size(IconSize::Small)
@@ -1044,15 +1223,16 @@ impl Render for BranchDiffToolbar {
                         )
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
-                                "Review Diff",
-                                Some(&ReviewDiff),
-                                "Send this diff for your last agent to review.",
+                                "Ask About This Change",
+                                Some(&AskAboutDiff),
+                                "Show the thread primed with the diff, the merge request, \
+                                 and the reading order, and ask away.",
                                 &focus_handle,
                                 cx,
                             )
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&ReviewDiff, window, cx);
+                            this.dispatch_action(&AskAboutDiff, window, cx);
                         })),
                 )
             })
@@ -1079,6 +1259,11 @@ impl Render for BranchDiffToolbar {
                             })),
                     )
             })
+            .children(render_review_buttons(
+                branch_diff.read(cx).diff.read(cx),
+                &focus_handle,
+                cx,
+            ))
     }
 }
 

@@ -802,6 +802,9 @@ pub enum AcpServerViewEvent {
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
 
 pub struct ConversationView {
+    /// The thread's first turn was sent on the user's behalf, so until they
+    /// send one themselves there is nothing to tell them about.
+    quiet_until_user_message: bool,
     agent: Rc<dyn AgentServer>,
     connection_store: Entity<AgentConnectionStore>,
     connection_key: Agent,
@@ -1121,6 +1124,7 @@ impl ConversationView {
         let thread_id = thread_id.unwrap_or_else(ThreadId::new);
 
         Self {
+            quiet_until_user_message: source == AgentThreadSource::ReviewPrimer,
             agent: agent.clone(),
             connection_store: connection_store.clone(),
             connection_key: connection_key.clone(),
@@ -3405,9 +3409,30 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_quiet_primer_turn(cx) {
+            return;
+        }
         #[cfg(feature = "audio")]
         self.play_notification_sound(window, cx);
         self.show_notification(caption, icon, window, cx);
+    }
+
+    /// Whether the thread is still on the turn that was sent for the user,
+    /// before they have asked anything themselves.
+    fn is_quiet_primer_turn(&self, cx: &App) -> bool {
+        if !self.quiet_until_user_message {
+            return false;
+        }
+        let Some(thread) = self.root_thread(cx) else {
+            return false;
+        };
+        let user_messages = thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .count();
+        user_messages <= 1
     }
 
     fn is_visible(&self, multi_workspace: &Entity<MultiWorkspace>, cx: &Context<Self>) -> bool {

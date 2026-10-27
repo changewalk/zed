@@ -1072,3 +1072,43 @@ pub struct ConfirmEditReviewComment {
 pub struct CancelEditReviewComment {
     pub id: usize,
 }
+
+/// Opens a reply box under a posted review comment.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyToReviewComment {
+    pub id: usize,
+}
+
+/// Sends the reply written under a posted review comment.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmReviewReply {
+    pub id: usize,
+}
+
+/// Closes the reply box under a posted review comment.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct CancelReviewReply {
+    pub id: usize,
+}
+
+/// Resolves the thread of a posted review comment, or reopens it.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleReviewThreadResolved {
+    pub id: usize,
+}
+
+/// Asks the model to draft a reply to the thread of a posted review comment.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = editor)]
+#[serde(deny_unknown_fields)]
+pub struct DraftReviewReply {
+    pub id: usize,
+}

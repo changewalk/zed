@@ -5,6 +5,7 @@ Below is a list of the changed files, with their git status, line counts, and th
 Rules for the notes:
 - At most three notes per file, and none for files a reviewer can skim: generated code, lock files, formatting, renames, and config.
 - A note guides the reader. It says what a part does, how it connects to another file, or what to compare it with. It is not a review finding, a verdict, or a style remark.
+- When the merge request's description or a linked issue explains why a part is there, say so in the note, so the reader knows the intent and not only the mechanics.
 - One sentence, at most twenty words.
 - "line" is a line number shown on a "+" line of that file. Put the note on the first line of the part it describes.
 

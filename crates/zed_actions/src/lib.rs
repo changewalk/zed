@@ -627,6 +627,25 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// Opens a new agent thread primed with the branch diff and some context
+    /// about it, so the user can ask questions about the change. The agent
+    /// is told to read, not review.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct AskAboutBranchDiff {
+        /// The full text of the diff.
+        pub diff_text: SharedString,
+        /// The base ref that the diff was computed against (e.g. "main").
+        pub base_ref: SharedString,
+        /// What the change is: the merge request's title, description, and
+        /// the suggested reading order, as plain text.
+        pub context: SharedString,
+        /// Whether to show and focus the panel, or prime the thread quietly
+        /// for later.
+        pub focus: bool,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

@@ -272,6 +272,9 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    /// A thread primed in the background with a diff to ask about. Its
+    /// first turn is housekeeping, so it does not notify or play a sound.
+    ReviewPrimer,
 }
 
 impl AgentThreadSource {
@@ -280,6 +283,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::ReviewPrimer => "review_primer",
         }
     }
 }

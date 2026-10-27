@@ -2,10 +2,15 @@ use crate::{
     conflict_view,
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
-    gitlab_review::{self, GitLabComment},
+    gitlab_review::{
+        self, Approvals, GitLabComment, RelatedIssue, RemoteDiscussion, ReviewerStanding,
+        ReviewerState,
+    },
+    review_cache::{self, LastReview},
     review_order::{
-        MAX_EXCERPT_BYTES_PER_FILE, ReviewNotes, ReviewOrder, ReviewOrderFile, build_notes_prompt,
-        build_order_prompt, parse_review_notes, parse_review_order,
+        MAX_EXCERPT_BYTES_PER_FILE, ReviewNotes, ReviewOrder, ReviewOrderFile, SummaryComment,
+        ThreadNote, build_notes_prompt, build_order_prompt, build_reply_prompt,
+        build_summary_prompt, order_from_description, parse_review_notes, parse_review_order,
     },
 };
 use agent_settings::AgentSettings;
@@ -13,7 +18,8 @@ use anyhow::{Context as _, Result};
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
+    Editor, EditorEvent, EditorSettings, ReviewCommentRecord, ReviewReply, ReviewThread,
+    SelectionEffects, SplittableEditor,
     actions::GoToHunk,
     display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
     multibuffer_context_lines,
@@ -23,15 +29,18 @@ use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Render, SharedString, Subscription, Task, WeakEntity,
+    AnyElement, App, AppContext as _, AsyncWindowContext, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Render,
+    SharedString, Subscription, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point};
+use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point, ToPoint as _};
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelProvider, LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, Role,
 };
-use markdown::{Markdown, MarkdownElement};
+use markdown::{
+    CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownOptions,
+};
 use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use project::{
     ConflictSet, Project, ProjectPath,
@@ -72,7 +81,6 @@ pub struct DiffMultibuffer {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
-    review_comment_count: usize,
     empty_label: SharedString,
     review_order: Option<Arc<ReviewOrder>>,
     review_order_state: ReviewOrderState,
@@ -84,6 +92,21 @@ pub struct DiffMultibuffer {
     _review_order_wait_task: Option<Task<()>>,
     merge_request: Option<MergeRequestHeader>,
     _merge_request_task: Option<Task<()>>,
+    _merge_request_details_task: Option<Task<()>>,
+    _review_threads_task: Option<Task<()>>,
+    /// Re-runs the thread sync a while after the last one finished.
+    _thread_refresh_task: Option<Task<()>>,
+    /// A reply, resolve, or draft in flight; one at a time is plenty.
+    _review_action_task: Option<Task<()>>,
+    review_summary: Option<ReviewSummary>,
+    /// A verdict is on its way to GitLab.
+    finishing_review: bool,
+    /// The base the diff had before it was switched to show only the
+    /// changes since the last review, for switching back.
+    base_before_since_review: Option<SharedString>,
+    /// Comments lifted out of the editor while the excerpts are rebuilt for a
+    /// new order, put back once the rebuild finishes.
+    held_review_comments: Vec<ReviewCommentRecord>,
     posting_review: bool,
     _post_review_task: Option<Task<()>>,
     _task: Task<Result<()>>,
@@ -96,8 +119,83 @@ struct MergeRequestHeader {
     title: SharedString,
     author: SharedString,
     web_url: SharedString,
+    project_path: Option<String>,
+    /// The tip of the source branch as GitLab last saw it.
+    head_sha: Option<String>,
     description: Option<Entity<Markdown>>,
+    description_text: Option<String>,
     expanded: bool,
+    /// The height the user dragged the description to; the default until
+    /// they do.
+    description_height: Option<Pixels>,
+    /// Where a drag of the description's bottom edge began: the pointer's
+    /// y and the height at the time.
+    description_drag: Option<(Pixels, Pixels)>,
+    related_issues: Vec<RelatedIssue>,
+    approvals: Option<Approvals>,
+    reviewer: Option<ReviewerStanding>,
+    last_review: Option<LastReview>,
+}
+
+impl MergeRequestHeader {
+    /// What the prompts are told about the merge request.
+    fn prompt_context(&self) -> String {
+        let mut context = format!("Title: {}\n", self.title);
+        if let Some(description) = &self.description_text {
+            writeln!(context, "Description:\n{}", description.trim()).ok();
+        }
+        for issue in &self.related_issues {
+            writeln!(context, "\nLinked issue #{}: {}", issue.iid, issue.title).ok();
+            if let Some(description) = issue.description.as_deref().map(str::trim)
+                && !description.is_empty()
+            {
+                writeln!(context, "{description}").ok();
+            }
+        }
+        context
+    }
+
+    /// The commit the user last reviewed, when the branch has moved on
+    /// since, so a diff against it shows what is new to them.
+    fn stale_last_review(&self) -> Option<&LastReview> {
+        let review = self.last_review.as_ref()?;
+        let moved_on = self
+            .head_sha
+            .as_deref()
+            .is_none_or(|head| head != review.head_sha);
+        moved_on.then_some(review)
+    }
+}
+
+/// The description's bottom edge while it is being dragged.
+#[derive(Clone)]
+struct DraggedDescriptionEdge;
+
+impl Render for DraggedDescriptionEdge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// How tall the description is until the user drags it.
+const DEFAULT_DESCRIPTION_HEIGHT: gpui::Rems = rems(18.);
+const MIN_DESCRIPTION_HEIGHT: gpui::Rems = rems(3.);
+const DESCRIPTION_HANDLE_SIZE: Pixels = px(6.);
+
+/// The summary comment being written to finish a review.
+struct ReviewSummary {
+    editor: Entity<Editor>,
+    drafting: bool,
+    posting: bool,
+}
+
+/// How a review is finished.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ReviewVerdict {
+    /// Just the summary comment, if any.
+    Comment,
+    Approve,
+    RequestChanges,
 }
 
 /// Where a request for a review order is up to.
@@ -146,13 +244,26 @@ impl DiffMultibuffer {
         let editor_subscription = cx.subscribe_in(&editor, window, Self::handle_editor_event);
 
         let primary_editor = editor.read(cx).rhs_editor().clone();
-        let review_comment_subscription =
-            cx.subscribe(&primary_editor, |this, _editor, event: &EditorEvent, cx| {
-                if let EditorEvent::ReviewCommentsChanged { total_count } = event {
-                    this.review_comment_count = *total_count;
-                    cx.notify();
+        let review_comment_subscription = cx.subscribe_in(
+            &primary_editor,
+            window,
+            |this, _editor, event: &EditorEvent, window, cx| match event {
+                EditorEvent::ReviewCommentsChanged { .. } => cx.notify(),
+                EditorEvent::ReviewReplySubmitted {
+                    discussion_id,
+                    body,
+                    ..
+                } => this.send_review_reply(discussion_id.clone(), body.clone(), window, cx),
+                EditorEvent::ReviewThreadResolveRequested {
+                    discussion_id,
+                    resolved,
+                } => this.resolve_review_thread(discussion_id.clone(), *resolved, window, cx),
+                EditorEvent::ReviewReplyDraftRequested { comment_id, .. } => {
+                    this.draft_review_reply(*comment_id, window, cx)
                 }
-            });
+                _ => {}
+            },
+        );
 
         let branch_diff_subscription = cx.subscribe_in(
             &branch_diff,
@@ -209,7 +320,7 @@ impl DiffMultibuffer {
             async |cx| Self::refresh(this, cx).await
         });
 
-        Self {
+        let mut this = Self {
             workspace: workspace.downgrade(),
             branch_diff,
             focus_handle,
@@ -217,7 +328,6 @@ impl DiffMultibuffer {
             multibuffer,
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
-            review_comment_count: 0,
             empty_label: empty_label.into(),
             review_order: None,
             review_order_state: ReviewOrderState::Idle,
@@ -228,6 +338,14 @@ impl DiffMultibuffer {
             _review_order_wait_task: None,
             merge_request: None,
             _merge_request_task: None,
+            _merge_request_details_task: None,
+            _review_threads_task: None,
+            _thread_refresh_task: None,
+            _review_action_task: None,
+            review_summary: None,
+            finishing_review: false,
+            base_before_since_review: None,
+            held_review_comments: Vec::new(),
             posting_review: false,
             _post_review_task: None,
             _task: task,
@@ -235,7 +353,48 @@ impl DiffMultibuffer {
                 branch_diff_subscription,
                 Subscription::join(editor_subscription, review_comment_subscription),
             ),
+        };
+        if matches!(this.diff_base(cx), DiffBase::Merge { .. }) {
+            this.load_threads_when_settled(window, cx);
         }
+        this
+    }
+
+    /// Shows the branch's merge request and its threads once the files have
+    /// loaded, so a branch diff of your own merge request carries the
+    /// reviewers' comments too. A branch with no merge request logs and
+    /// shows nothing.
+    fn load_threads_when_settled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const MAX_POLLS: usize = 120;
+
+        self._review_threads_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut settled_count = None;
+            for _ in 0..MAX_POLLS {
+                let settled =
+                    this.update(cx, |this, cx| this.files_settled(&mut settled_count, cx));
+                match settled {
+                    Ok(true) => break,
+                    Ok(false) => cx.background_executor().timer(POLL_INTERVAL).await,
+                    Err(_) => return,
+                }
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.load_merge_request(None, cx);
+                this.sync_review_threads(window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Whether every file has loaded and the count has held still since the
+    /// last call. The files arrive in batches, so one poll is not enough.
+    fn files_settled(&self, settled_count: &mut Option<usize>, cx: &App) -> bool {
+        let count = self.buffer_subscriptions.len();
+        let loaded = count > 0 && !self.is_loading(cx);
+        let settled = loaded && *settled_count == Some(count);
+        *settled_count = loaded.then_some(count);
+        settled
     }
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
@@ -365,11 +524,6 @@ impl DiffMultibuffer {
         self.multibuffer.read(cx).snapshot(cx).total_changed_lines()
     }
 
-    /// Returns the total count of review comments across all hunks/files.
-    pub(crate) fn total_review_comment_count(&self) -> usize {
-        self.review_comment_count
-    }
-
     pub(crate) fn review_order(&self) -> Option<&Arc<ReviewOrder>> {
         self.review_order.as_ref()
     }
@@ -400,6 +554,15 @@ impl DiffMultibuffer {
         }
         self.review_order = order;
         self.pending_scroll.take();
+        // Re-sorting rebuilds the excerpts, which would orphan the comments'
+        // anchors, so hold them by file and row until the refresh is done.
+        let records = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .clone()
+            .update(cx, |editor, cx| editor.take_review_comment_records(cx));
+        self.held_review_comments.extend(records);
         self._task = window.spawn(cx, {
             let this = cx.weak_entity();
             async |cx| Self::refresh(this, cx).await
@@ -450,10 +613,35 @@ impl DiffMultibuffer {
                 }
             };
             this.update(cx, |this, cx| {
-                let description = merge_request
+                let languages = this
+                    .workspace
+                    .upgrade()
+                    .map(|workspace| workspace.read(cx).project().read(cx).languages().clone());
+                let project_path = merge_request.project_path();
+                let head_sha = merge_request.head_sha().map(str::to_string);
+                let description_text = merge_request
                     .description
-                    .filter(|text| !text.trim().is_empty())
-                    .map(|text| cx.new(|cx| Markdown::new(text.into(), None, None, cx)));
+                    .filter(|text| !text.trim().is_empty());
+                let description = description_text.clone().map(|text| {
+                    cx.new(|cx| {
+                        // Descriptions carry diagrams and HTML details
+                        // blocks, which the defaults leave as text.
+                        Markdown::new_with_options(
+                            text.into(),
+                            languages,
+                            None,
+                            MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                });
+                let last_review = review_cache::load_last_review(&merge_request.web_url)
+                    .log_err()
+                    .flatten();
                 this.merge_request = Some(MergeRequestHeader {
                     iid: merge_request.iid,
                     title: merge_request.title.into(),
@@ -462,14 +650,191 @@ impl DiffMultibuffer {
                         .map(|author| author.name)
                         .unwrap_or_default()
                         .into(),
+                    project_path,
+                    head_sha,
                     web_url: merge_request.web_url.into(),
                     description,
+                    description_text,
                     expanded: true,
+                    description_height: None,
+                    description_drag: None,
+                    related_issues: Vec::new(),
+                    approvals: None,
+                    reviewer: None,
+                    last_review,
                 });
+                this.load_merge_request_details(cx);
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// Fetches what the header shows besides the description: the linked
+    /// issues, who approved, and the user's own reviewer state. Each is
+    /// optional, so a failure only logs.
+    fn load_merge_request_details(&mut self, cx: &mut Context<Self>) {
+        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+            return;
+        };
+        let issues =
+            cx.background_spawn(gitlab_review::fetch_related_issues(work_dir.clone(), iid));
+        let approvals = cx.background_spawn(gitlab_review::fetch_approvals(work_dir.clone(), iid));
+        let reviewer = cx.background_spawn(gitlab_review::fetch_reviewer_standing(work_dir, iid));
+        self._merge_request_details_task = Some(cx.spawn(async move |this, cx| {
+            let (issues, approvals, reviewer) = futures::join!(issues, approvals, reviewer);
+            this.update(cx, |this, cx| {
+                let Some(header) = this.merge_request.as_mut() else {
+                    return;
+                };
+                match issues {
+                    Ok(issues) => header.related_issues = issues,
+                    Err(error) => log::warn!("no linked issues for the review: {error:#}"),
+                }
+                match approvals {
+                    Ok(approvals) => header.approvals = Some(approvals),
+                    Err(error) => log::warn!("no approvals for the review: {error:#}"),
+                }
+                match reviewer {
+                    Ok(reviewer) => header.reviewer = Some(reviewer),
+                    Err(error) => log::warn!("no reviewer state for the review: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn work_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let repo = self.branch_diff.read(cx).repo()?;
+        Some(repo.read(cx).work_directory_abs_path.to_path_buf())
+    }
+
+    fn merge_request_iid(&self) -> Option<u64> {
+        self.merge_request.as_ref().map(|header| header.iid)
+    }
+
+    /// The tip of the checked out branch.
+    fn head_sha(&self, cx: &App) -> Option<String> {
+        let repo = self.branch_diff.read(cx).repo()?;
+        repo.read(cx)
+            .head_commit
+            .as_ref()
+            .map(|commit| commit.sha.to_string())
+    }
+
+    /// What the prompts are told about the merge request, once it is known.
+    fn merge_request_context(&self) -> Option<String> {
+        self.merge_request
+            .as_ref()
+            .map(MergeRequestHeader::prompt_context)
+    }
+
+    /// What a thread about this diff is told before the user's question:
+    /// the merge request, then the reading order with its notes.
+    pub(crate) fn ask_context(&self) -> String {
+        let mut context = match self.merge_request.as_ref() {
+            Some(header) => format!(
+                "I am reviewing merge request !{} by {}.\n{}",
+                header.iid,
+                header.author,
+                header.prompt_context()
+            ),
+            None => "I am reviewing this branch diff.\n".to_string(),
+        };
+        if let Some(order) = &self.review_order {
+            context.push_str("\nSuggested reading order:\n");
+            for (index, entry) in order.entries().iter().enumerate() {
+                writeln!(
+                    context,
+                    "{}. {} — {}",
+                    index + 1,
+                    entry.path.as_unix_str(),
+                    entry.reason
+                )
+                .ok();
+                for note in &entry.notes {
+                    writeln!(context, "   line {}: {}", note.line, note.text).ok();
+                }
+            }
+        }
+        context
+    }
+
+    /// Whether the merge request and its details have been looked up, or
+    /// there is nothing to look up. The prompts wait for this so the notes
+    /// can draw on the description.
+    fn merge_request_settled(&self) -> bool {
+        self._merge_request_task
+            .as_ref()
+            .is_none_or(|task| task.is_ready())
+            && self
+                ._merge_request_details_task
+                .as_ref()
+                .is_none_or(|task| task.is_ready())
+    }
+
+    pub(crate) fn has_merge_request(&self) -> bool {
+        self.merge_request.is_some()
+    }
+
+    /// Whether the user has approved the merge request, once known, and
+    /// whether a verdict is in flight.
+    pub(crate) fn approval_state(&self) -> Option<(bool, bool)> {
+        let approvals = self.merge_request.as_ref()?.approvals.as_ref()?;
+        Some((approvals.user_has_approved, self.finishing_review))
+    }
+
+    /// The commit the user last reviewed, when the branch has moved on
+    /// since, with whether the diff is currently against it.
+    pub(crate) fn changes_since_review(&self, cx: &App) -> Option<(LastReview, bool)> {
+        let review = self.merge_request.as_ref()?.stale_last_review()?.clone();
+        let showing = matches!(
+            self.diff_base(cx),
+            DiffBase::Merge { base_ref } if base_ref.as_ref() == review.head_sha
+        );
+        Some((review, showing))
+    }
+
+    /// Diffs against the commit the user last reviewed, so only what changed
+    /// since is shown, or back against the usual base.
+    pub(crate) fn toggle_changes_since_review(&mut self, cx: &mut Context<Self>) {
+        let Some((review, showing)) = self.changes_since_review(cx) else {
+            return;
+        };
+        let base_ref = if showing {
+            match self.base_before_since_review.take() {
+                Some(base_ref) => base_ref,
+                None => return,
+            }
+        } else {
+            if let DiffBase::Merge { base_ref } = self.diff_base(cx) {
+                self.base_before_since_review = Some(base_ref.clone());
+            }
+            SharedString::from(review.head_sha)
+        };
+        self.branch_diff.update(cx, |branch_diff, cx| {
+            branch_diff.set_diff_base(DiffBase::Merge { base_ref }, cx);
+        });
+        cx.notify();
+    }
+
+    /// Records the current tip as reviewed, so the next visit can show only
+    /// what changed after it.
+    pub(crate) fn mark_reviewed(&mut self, cx: &mut Context<Self>) {
+        let Some(head_sha) = self.head_sha(cx) else {
+            return;
+        };
+        let Some(header) = self.merge_request.as_mut() else {
+            return;
+        };
+        let review = LastReview {
+            head_sha,
+            at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        };
+        review_cache::store_last_review(&header.web_url, &review).log_err();
+        header.last_review = Some(review);
+        cx.notify();
     }
 
     fn render_merge_request_header(
@@ -479,7 +844,6 @@ impl DiffMultibuffer {
     ) -> Option<AnyElement> {
         let header = self.merge_request.as_ref()?;
         let web_url = header.web_url.clone();
-        let colors = cx.theme().colors();
         let title_row = h_flex()
             .w_full()
             .gap_2()
@@ -495,12 +859,7 @@ impl DiffMultibuffer {
                     },
                 )
                 .icon_size(IconSize::Small)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(header) = this.merge_request.as_mut() {
-                        header.expanded = !header.expanded;
-                        cx.notify();
-                    }
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_merge_request_description(cx))),
             )
             .child(Label::new(header.title.clone()).weight(FontWeight::SEMIBOLD))
             .child(
@@ -508,6 +867,22 @@ impl DiffMultibuffer {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .children(header.approvals.as_ref().and_then(|approvals| {
+                (!approvals.approved_by.is_empty()).then(|| {
+                    Label::new(format!("Approved by {}", approvals.approved_by.join(", ")))
+                        .size(LabelSize::Small)
+                        .color(Color::Success)
+                })
+            }))
+            .children(header.reviewer.as_ref().and_then(|reviewer| {
+                let (text, color) = match reviewer.state {
+                    ReviewerState::RequestedChanges => ("You requested changes", Color::Warning),
+                    ReviewerState::Approved => ("You approved", Color::Success),
+                    ReviewerState::Reviewed => ("You reviewed", Color::Muted),
+                    ReviewerState::Unreviewed => return None,
+                };
+                Some(Label::new(text).size(LabelSize::Small).color(color))
+            }))
             .child(div().flex_1())
             .child(
                 IconButton::new("merge-request-open", IconName::ArrowUpRight)
@@ -515,24 +890,79 @@ impl DiffMultibuffer {
                     .tooltip(Tooltip::text("Open the merge request in the browser"))
                     .on_click(move |_, _, cx| cx.open_url(&web_url)),
             );
+        let description_height = header
+            .description_height
+            .unwrap_or_else(|| DEFAULT_DESCRIPTION_HEIGHT.to_pixels(window.rem_size()));
         let description = header
             .expanded
             .then(|| header.description.clone())
             .flatten()
             .map(|markdown| {
-                div()
-                    .id("merge-request-description")
+                // The bottom edge drags to resize, and double-clicks back to
+                // the default height.
+                let handle = div()
+                    .id("merge-request-description-handle")
                     .w_full()
-                    .max_h(rems(18.))
-                    .overflow_y_scroll()
-                    .px_3()
-                    .pb_2()
-                    .text_sm()
-                    .child(MarkdownElement::new(
-                        markdown,
-                        editor::hover_markdown_style(window, cx),
-                    ))
+                    .h(DESCRIPTION_HANDLE_SIZE)
+                    .flex_shrink_0()
+                    .cursor_row_resize()
+                    .hover(|style| style.bg(cx.theme().colors().border_focused))
+                    .on_drag(DraggedDescriptionEdge, |edge, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| edge.clone())
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if let Some(header) = this.merge_request.as_mut() {
+                                header.description_drag =
+                                    Some((event.position.y, description_height));
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            if event.click_count == 2
+                                && let Some(header) = this.merge_request.as_mut()
+                            {
+                                header.description_height = None;
+                                cx.notify();
+                            }
+                        }),
+                    );
+                v_flex()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("merge-request-description")
+                            .w_full()
+                            .h(description_height)
+                            .overflow_y_scroll()
+                            .px_3()
+                            .pb_2()
+                            .text_sm()
+                            .child(
+                                MarkdownElement::new(
+                                    markdown,
+                                    editor::hover_markdown_style(window, cx),
+                                )
+                                .code_block_renderer(
+                                    CodeBlockRenderer::Default {
+                                        copy_button_visibility:
+                                            CopyButtonVisibility::VisibleOnHover,
+                                        wrap_button_visibility:
+                                            markdown::WrapButtonVisibility::Hidden,
+                                        border: true,
+                                    },
+                                ),
+                            ),
+                    )
+                    .child(handle)
             });
+        let summary = self.render_review_summary(cx);
+        let colors = cx.theme().colors();
         Some(
             v_flex()
                 .w_full()
@@ -541,8 +971,524 @@ impl DiffMultibuffer {
                 .border_color(colors.border)
                 .child(title_row)
                 .children(description)
+                .children(summary)
                 .into_any_element(),
         )
+    }
+
+    /// Follows a drag of the description's bottom edge, keeping the height
+    /// between a few lines and the window.
+    fn drag_description_edge(
+        &mut self,
+        event: &DragMoveEvent<DraggedDescriptionEdge>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(header) = self.merge_request.as_mut() else {
+            return;
+        };
+        let Some((start_y, start_height)) = header.description_drag else {
+            return;
+        };
+        let min = MIN_DESCRIPTION_HEIGHT.to_pixels(window.rem_size());
+        let max = window.viewport_size().height * 0.8;
+        let height = (start_height + event.event.position.y - start_y).clamp(min, max);
+        if header.description_height != Some(height) {
+            header.description_height = Some(height);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_merge_request_description(&mut self, cx: &mut Context<Self>) {
+        if let Some(header) = self.merge_request.as_mut() {
+            header.expanded = !header.expanded;
+            cx.notify();
+        }
+    }
+
+    /// Opens the box for the summary comment that finishes the review, or
+    /// closes it.
+    pub(crate) fn toggle_review_summary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_summary.take().is_some() {
+            cx.notify();
+            return;
+        }
+        if self.merge_request.is_none() {
+            return;
+        }
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(3, 12, window, cx);
+            editor.set_placeholder_text(
+                "Summarise your review, or draft one from your comments…",
+                window,
+                cx,
+            );
+            editor
+        });
+        let focus_handle = editor.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        self.review_summary = Some(ReviewSummary {
+            editor,
+            drafting: false,
+            posting: false,
+        });
+        cx.notify();
+    }
+
+    fn render_review_summary(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let summary = self.review_summary.as_ref()?;
+        let header = self.merge_request.as_ref()?;
+        let colors = cx.theme().colors();
+        let busy = summary.drafting || summary.posting;
+        let approved = header
+            .approvals
+            .as_ref()
+            .is_some_and(|approvals| approvals.user_has_approved);
+        let changes_requested = header
+            .reviewer
+            .as_ref()
+            .is_some_and(|reviewer| reviewer.state == ReviewerState::RequestedChanges);
+        let status = if summary.drafting {
+            "Drafting from your comments…"
+        } else if summary.posting {
+            "Sending to GitLab…"
+        } else {
+            "Finish your review"
+        };
+        let buttons = h_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                Button::new("review-summary-draft", "Draft from Comments")
+                    .start_icon(Icon::new(IconName::Sparkle).size(IconSize::Small))
+                    .disabled(busy)
+                    .tooltip(Tooltip::text(
+                        "Ask the model to write a summary of your comments",
+                    ))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.draft_review_summary(window, cx)),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("review-summary-comment", "Comment")
+                    .disabled(busy)
+                    .tooltip(Tooltip::text("Post the summary without a verdict"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.finish_review(ReviewVerdict::Comment, window, cx)
+                    })),
+            )
+            .child(
+                Button::new(
+                    "review-summary-request-changes",
+                    if changes_requested {
+                        "Withdraw Request"
+                    } else {
+                        "Request Changes"
+                    },
+                )
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.finish_review(ReviewVerdict::RequestChanges, window, cx)
+                })),
+            )
+            .child(
+                Button::new(
+                    "review-summary-approve",
+                    if approved { "Unapprove" } else { "Approve" },
+                )
+                .style(ButtonStyle::Filled)
+                .disabled(busy)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.finish_review(ReviewVerdict::Approve, window, cx)
+                })),
+            )
+            .child(
+                IconButton::new("review-summary-close", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Close"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_review_summary(window, cx)),
+                    ),
+            );
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(colors.border)
+                .child(
+                    Label::new(status)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .border_1()
+                        .border_color(colors.border)
+                        .rounded_md()
+                        .bg(colors.editor_background)
+                        .px_2()
+                        .py_1()
+                        .child(summary.editor.clone()),
+                )
+                .child(buttons)
+                .into_any_element(),
+        )
+    }
+
+    /// The user's own comments, posted or not, with their place in the new
+    /// version of the file, for the summary prompt.
+    fn own_comments_for_summary(&self, cx: &App) -> Vec<SummaryComment> {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        self.editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments()
+            .into_iter()
+            .filter(|comment| comment.author.is_none())
+            .filter_map(|comment| {
+                let end = comment.range.end.to_point(&snapshot);
+                let (_, point) = snapshot.point_to_buffer_point(end)?;
+                Some(SummaryComment {
+                    path: comment.file_path.as_unix_str().to_string(),
+                    line: point.row + 1,
+                    text: comment.text,
+                })
+            })
+            .collect()
+    }
+
+    /// Asks the model for a summary of the user's comments and puts it in
+    /// the summary box for editing.
+    fn draft_review_summary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let comments = self.own_comments_for_summary(cx);
+        if comments.is_empty() {
+            self.show_workspace_error(
+                "Write some inline comments first; the summary is drawn from them.".into(),
+                cx,
+            );
+            return;
+        }
+        let Some(summary) = self.review_summary.as_mut() else {
+            return;
+        };
+        summary.drafting = true;
+        cx.notify();
+        let prompt = build_summary_prompt(self.merge_request_context().as_deref(), &comments);
+        let request = self.model_request(prompt, cx);
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = match request {
+                Ok((provider, model, request)) => complete_text(provider, model, request, cx).await,
+                Err(error) => Err(error),
+            };
+            this.update_in(cx, |this, window, cx| {
+                let Some(summary) = this.review_summary.as_mut() else {
+                    return;
+                };
+                summary.drafting = false;
+                match result {
+                    Ok(text) => {
+                        let editor = summary.editor.clone();
+                        editor.update(cx, |editor, cx| {
+                            editor.set_text(text.trim().to_string(), window, cx)
+                        });
+                    }
+                    Err(error) => this.show_workspace_error(
+                        format!("Could not draft the summary: {error:#}"),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Posts the summary, if any, then gives the verdict, and records the
+    /// tip as reviewed.
+    pub(crate) fn finish_review(
+        &mut self,
+        verdict: ReviewVerdict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((work_dir, header)) = self.work_dir(cx).zip(self.merge_request.as_ref()) else {
+            return;
+        };
+        let iid = header.iid;
+        let project_path = header.project_path.clone();
+        let approved = header
+            .approvals
+            .as_ref()
+            .is_some_and(|approvals| approvals.user_has_approved);
+        let changes_requested = header
+            .reviewer
+            .as_ref()
+            .is_some_and(|reviewer| reviewer.state == ReviewerState::RequestedChanges);
+        if self.finishing_review {
+            return;
+        }
+        // From the toolbar there is no summary box; the verdict goes alone.
+        let body = self
+            .review_summary
+            .as_mut()
+            .map(|summary| {
+                summary.posting = true;
+                summary.editor.read(cx).text(cx).trim().to_string()
+            })
+            .unwrap_or_default();
+        self.finishing_review = true;
+        cx.notify();
+
+        let request = cx.background_spawn(async move {
+            if !body.is_empty() {
+                gitlab_review::post_note(work_dir.clone(), iid, body).await?;
+            }
+            match verdict {
+                ReviewVerdict::Comment => {}
+                ReviewVerdict::Approve => {
+                    gitlab_review::set_approval(work_dir, iid, !approved).await?
+                }
+                ReviewVerdict::RequestChanges => {
+                    let project_path =
+                        project_path.context("the merge request's project path is unknown")?;
+                    gitlab_review::set_changes_requested(
+                        work_dir,
+                        project_path,
+                        iid,
+                        !changes_requested,
+                    )
+                    .await?
+                }
+            }
+            anyhow::Ok(())
+        });
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            this.update_in(cx, |this, window, cx| {
+                this.finishing_review = false;
+                if let Some(summary) = this.review_summary.as_mut() {
+                    summary.posting = false;
+                }
+                match result {
+                    Ok(()) => {
+                        let what = match verdict {
+                            ReviewVerdict::Comment => "Posted your summary",
+                            ReviewVerdict::Approve if approved => "Withdrew your approval",
+                            ReviewVerdict::Approve => "Approved",
+                            ReviewVerdict::RequestChanges if changes_requested => {
+                                "Withdrew your request for changes"
+                            }
+                            ReviewVerdict::RequestChanges => "Requested changes",
+                        };
+                        this.review_summary.take();
+                        this.mark_reviewed(cx);
+                        this.load_merge_request_details(cx);
+                        this.show_review_toast(format!("{what} on !{iid}"), cx);
+                        this.sync_review_threads(window, cx);
+                    }
+                    Err(error) => this.show_workspace_error(
+                        format!("Could not finish the review: {error:#}"),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn show_review_toast(&self, message: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let web_url = self
+            .merge_request
+            .as_ref()
+            .map(|header| header.web_url.to_string());
+        workspace.update(cx, |workspace, cx| {
+            struct ReviewToast;
+            let mut toast = Toast::new(NotificationId::unique::<ReviewToast>(), message).autohide();
+            if let Some(web_url) = web_url {
+                toast = toast.on_click("Open", move |_, cx| cx.open_url(&web_url));
+            }
+            workspace.show_toast(toast, cx);
+        });
+    }
+
+    /// Sends `body` as a reply on the thread and shows it under the comment.
+    fn send_review_reply(
+        &mut self,
+        discussion_id: String,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+            self.show_workspace_error("No merge request is loaded to reply on.".into(), cx);
+            return;
+        };
+        let request = cx.background_spawn(gitlab_review::reply_to_discussion(
+            work_dir,
+            iid,
+            discussion_id.clone(),
+            body,
+        ));
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(note) => {
+                    this.editor
+                        .read(cx)
+                        .rhs_editor()
+                        .clone()
+                        .update(cx, |editor, cx| {
+                            editor.append_review_reply(
+                                &discussion_id,
+                                ReviewReply {
+                                    author: note.author.into(),
+                                    body: note.body,
+                                },
+                                window,
+                                cx,
+                            );
+                        });
+                }
+                Err(error) => {
+                    this.show_workspace_error(format!("Could not send the reply: {error:#}"), cx)
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Resolves or reopens the thread on GitLab, then shows it so.
+    fn resolve_review_thread(
+        &mut self,
+        discussion_id: String,
+        resolved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+            return;
+        };
+        let request = cx.background_spawn(gitlab_review::resolve_discussion(
+            work_dir,
+            iid,
+            discussion_id.clone(),
+            resolved,
+        ));
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.editor
+                        .read(cx)
+                        .rhs_editor()
+                        .clone()
+                        .update(cx, |editor, cx| {
+                            editor.set_review_thread_resolved(&discussion_id, resolved, window, cx);
+                        });
+                }
+                Err(error) => this.show_workspace_error(
+                    format!("Could not change the thread's resolved state: {error:#}"),
+                    cx,
+                ),
+            })
+            .ok();
+        }));
+    }
+
+    /// Asks the model for a reply to the thread under `comment_id` and puts
+    /// it in the reply box for editing.
+    fn draft_review_reply(
+        &mut self,
+        comment_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.read(cx).rhs_editor().clone();
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let Some(comment) = editor
+            .read(cx)
+            .review_comments()
+            .into_iter()
+            .find(|comment| comment.id == comment_id)
+        else {
+            return;
+        };
+        let Some(thread) = comment.thread.as_ref() else {
+            return;
+        };
+        let own_name = self
+            .merge_request
+            .as_ref()
+            .and_then(|header| header.reviewer.as_ref())
+            .map(|reviewer| reviewer.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "the reviewer".to_string());
+        let mut notes = vec![ThreadNote {
+            author: comment
+                .author
+                .as_ref()
+                .map(|author| author.to_string())
+                .unwrap_or_else(|| own_name.clone()),
+            body: comment.text.clone(),
+        }];
+        notes.extend(thread.replies.iter().map(|reply| ThreadNote {
+            author: reply.author.to_string(),
+            body: reply.body.clone(),
+        }));
+        let code: String = snapshot.text_for_range(comment.range.clone()).collect();
+        let prompt = build_reply_prompt(
+            self.merge_request_context().as_deref(),
+            comment.file_path.as_unix_str(),
+            &code,
+            &notes,
+            &own_name,
+        );
+        let request = self.model_request(prompt, cx);
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = match request {
+                Ok((provider, model, request)) => complete_text(provider, model, request, cx).await,
+                Err(error) => Err(error),
+            };
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(text) => editor.update(cx, |editor, cx| {
+                    editor.set_review_reply_draft(comment_id, text.trim().to_string(), window, cx)
+                }),
+                Err(error) => {
+                    this.show_workspace_error(format!("Could not draft a reply: {error:#}"), cx)
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// A request for `prompt` to the commit message model, with its provider.
+    fn model_request(
+        &self,
+        prompt: String,
+        cx: &App,
+    ) -> Result<(
+        Arc<dyn LanguageModelProvider>,
+        LanguageModel,
+        LanguageModelRequest,
+    )> {
+        let registry = LanguageModelRegistry::read_global(cx);
+        let model = registry
+            .commit_message_model(cx)
+            .or_else(|| registry.default_fast_model(cx))
+            .context("no language model is available")?;
+        let provider = registry.provider_for_model(&model)?;
+        let request = text_request(prompt, &model, cx);
+        Ok((provider, model, request))
     }
 
     /// Whether the file list or the file contents are still being loaded.
@@ -594,11 +1540,8 @@ impl DiffMultibuffer {
             let mut settled_count = None;
             for _ in 0..MAX_POLLS {
                 let ready = this.update(cx, |this, cx| {
-                    let count = this.buffer_subscriptions.len();
-                    let loaded = count > 0 && !this.is_loading(cx);
-                    let settled = loaded && settled_count == Some(count);
-                    settled_count = loaded.then_some(count);
-                    settled
+                    this.files_settled(&mut settled_count, cx)
+                        && this.merge_request_settled()
                         && LanguageModelRegistry::read_global(cx)
                             .commit_message_model(cx)
                             .is_some()
@@ -657,9 +1600,36 @@ impl DiffMultibuffer {
         if files.is_empty() {
             return;
         }
+        // The same commit against the same base is the same diff, so an
+        // order written for it before is as good as a new one, and instant.
+        let cache_key = self.review_cache_key(cx);
+        if let Some(order) = cache_key
+            .as_deref()
+            .and_then(|key| review_cache::load_order(key).log_err().flatten())
+        {
+            self.set_review_order(Some(Arc::new(order)), window, cx);
+            return;
+        }
         let known_paths: Vec<RepoPath> = files.iter().map(|file| file.path.clone()).collect();
-        let order_request = text_request(build_order_prompt(&files, None), &order_model, cx);
-        let notes_request = text_request(build_notes_prompt(&files, None), &notes_model, cx);
+        let context = self.merge_request_context();
+        // The author's own reading order, when the description gives one,
+        // comes first whatever the model says.
+        let pinned = self
+            .merge_request
+            .as_ref()
+            .and_then(|header| header.description_text.as_deref())
+            .map(|description| order_from_description(description, &known_paths))
+            .unwrap_or_default();
+        let order_request = text_request(
+            build_order_prompt(&files, context.as_deref()),
+            &order_model,
+            cx,
+        );
+        let notes_request = text_request(
+            build_notes_prompt(&files, context.as_deref()),
+            &notes_model,
+            cx,
+        );
 
         self.pending_notes.take();
         self.review_order_state = ReviewOrderState::Suggesting;
@@ -669,7 +1639,8 @@ impl DiffMultibuffer {
             async move |this, cx| {
                 let result = complete_text(order_provider, order_model, order_request, cx)
                     .await
-                    .and_then(|text| parse_review_order(&text, &known_paths));
+                    .and_then(|text| parse_review_order(&text, &known_paths))
+                    .map(|order| order.with_pinned_first(&pinned));
                 this.update_in(cx, |this, window, cx| match result {
                     Ok(order) => this.set_review_order(Some(Arc::new(order)), window, cx),
                     Err(error) => this.fail_review_order(format!("{error:#}").into(), cx),
@@ -682,7 +1653,13 @@ impl DiffMultibuffer {
                 .await
                 .and_then(|text| parse_review_notes(&text, &known_paths));
             this.update(cx, |this, cx| match result {
-                Ok(notes) => this.apply_review_notes(notes, cx),
+                Ok(notes) => {
+                    this.apply_review_notes(notes, cx);
+                    if let Some((key, order)) = cache_key.as_deref().zip(this.review_order.clone())
+                    {
+                        review_cache::store_order(key, &order).log_err();
+                    }
+                }
                 Err(error) => {
                     log::warn!("review notes failed: {error:#}");
                     this.show_workspace_error(
@@ -693,6 +1670,17 @@ impl DiffMultibuffer {
             })
             .ok();
         }));
+    }
+
+    /// Where the order for this diff is cached: by repository, base, and
+    /// commit. None when the tip is unknown.
+    fn review_cache_key(&self, cx: &App) -> Option<String> {
+        let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
+            return None;
+        };
+        let work_dir = self.work_dir(cx)?;
+        let head_sha = self.head_sha(cx)?;
+        Some(review_cache::order_key(&work_dir, &base_ref, &head_sha))
     }
 
     /// Puts `notes` on the current order, or keeps them for the order that
@@ -738,9 +1726,23 @@ impl DiffMultibuffer {
         self.posting_review
     }
 
-    /// Posts the stored review comments as inline discussions on the open
-    /// merge request of the current branch, then drops the ones that posted.
-    pub(crate) fn post_review_to_gitlab(&mut self, cx: &mut Context<Self>) {
+    /// The comments written here that are not on the merge request yet, as
+    /// opposed to posted ones and threads pulled in from the review.
+    pub(crate) fn unposted_review_comment_count(&self, cx: &App) -> usize {
+        self.editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments()
+            .iter()
+            .filter(|comment| comment.thread.is_none())
+            .count()
+    }
+
+    /// Posts the stored review comments that are not on the merge request yet
+    /// as inline discussions, keeps them marked as posted, and then pulls the
+    /// threads back so replies show up.
+    pub(crate) fn post_review_to_gitlab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.posting_review {
             return;
         }
@@ -766,9 +1768,9 @@ impl DiffMultibuffer {
         self.posting_review = true;
         cx.notify();
         let outcome = cx.background_spawn(gitlab_review::post_review(work_dir, branch, comments));
-        self._post_review_task = Some(cx.spawn(async move |this, cx| {
+        self._post_review_task = Some(cx.spawn_in(window, async move |this, cx| {
             let outcome = outcome.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.posting_review = false;
                 match outcome {
                     Ok(outcome) => {
@@ -777,26 +1779,32 @@ impl DiffMultibuffer {
                             .rhs_editor()
                             .clone()
                             .update(cx, |editor, cx| {
-                                for id in &outcome.posted_ids {
-                                    editor.remove_review_comment(*id, cx);
+                                for (id, discussion_id) in &outcome.posted {
+                                    editor.mark_review_comment_posted(
+                                        *id,
+                                        discussion_id.clone(),
+                                        window,
+                                        cx,
+                                    );
                                 }
                             });
                         match outcome.error {
                             Some(error) => this.fail_post_review(
                                 format!(
                                     "{} of the comments posted, then: {error:#}",
-                                    outcome.posted_ids.len()
+                                    outcome.posted.len()
                                 )
                                 .into(),
                                 cx,
                             ),
                             None => this.show_posted_review_toast(
-                                outcome.posted_ids.len(),
+                                outcome.posted.len(),
                                 outcome.merge_request.iid,
                                 outcome.merge_request.web_url,
                                 cx,
                             ),
                         }
+                        this.sync_review_threads(window, cx);
                     }
                     Err(error) => this.fail_post_review(format!("{error:#}").into(), cx),
                 }
@@ -804,6 +1812,249 @@ impl DiffMultibuffer {
             })
             .ok();
         }));
+    }
+
+    /// Pulls the merge request's threads into the editor: replies for the
+    /// comments posted from here, and threads others opened as comments by
+    /// their authors.
+    pub(crate) fn sync_review_threads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.branch_diff.read(cx).repo().cloned() else {
+            return;
+        };
+        let (work_dir, branch) = {
+            let repo = repo.read(cx);
+            (
+                repo.work_directory_abs_path.to_path_buf(),
+                repo.branch.as_ref().map(|branch| branch.name().to_string()),
+            )
+        };
+        let Some(branch) = branch else {
+            return;
+        };
+        let iid = self.merge_request.as_ref().map(|header| header.iid);
+        let fetch = cx.background_spawn(async move {
+            let iid = match iid {
+                Some(iid) => iid,
+                None => {
+                    gitlab_review::merge_request_for_branch(work_dir.clone(), branch)
+                        .await?
+                        .iid
+                }
+            };
+            gitlab_review::fetch_discussions(work_dir, iid).await
+        });
+        self._review_threads_task = Some(cx.spawn_in(window, async move |this, cx| {
+            match fetch.await {
+                Ok(discussions) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.apply_remote_discussions(discussions, window, cx)
+                    })
+                    .ok();
+                }
+                Err(error) => log::warn!("could not load the merge request threads: {error:#}"),
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.schedule_thread_refresh(window, cx)
+            })
+            .ok();
+        }));
+    }
+
+    /// Runs the thread sync again after a pause, so replies and new threads
+    /// show up while the diff stays open.
+    fn schedule_thread_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+        self._thread_refresh_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(REFRESH_INTERVAL).await;
+            this.update_in(cx, |this, window, cx| {
+                if !this.posting_review {
+                    this.sync_review_threads(window, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Puts the comments held over a re-sort back under their lines. A
+    /// comment whose lines the diff no longer shows is dropped.
+    fn restore_held_review_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.held_review_comments.is_empty() {
+            return;
+        }
+        let records = std::mem::take(&mut self.held_review_comments);
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let buffers_by_file: HashMap<Arc<RelPath>, language::BufferSnapshot> = self
+            .buffer_subscriptions
+            .values()
+            .filter_map(|subscription| {
+                let buffer = subscription.display_buffer.read(cx);
+                Some((buffer.file()?.path().clone(), buffer.snapshot()))
+            })
+            .collect();
+        self.editor
+            .read(cx)
+            .rhs_editor()
+            .clone()
+            .update(cx, |editor, cx| {
+                for record in records {
+                    let Some(buffer) = buffers_by_file.get(&record.file_path) else {
+                        continue;
+                    };
+                    let Some(range) =
+                        anchor_range_for_rows(&snapshot, buffer, record.start_row, record.end_row)
+                    else {
+                        log::warn!(
+                            "dropping a review comment on {}:{} that the diff no longer shows",
+                            record.file_path.as_unix_str(),
+                            record.start_row + 1
+                        );
+                        continue;
+                    };
+                    editor.add_review_comment_at(
+                        record.file_path,
+                        range,
+                        record.text,
+                        record.author,
+                        record.thread,
+                        window,
+                        cx,
+                    );
+                }
+            });
+    }
+
+    fn apply_remote_discussions(
+        &mut self,
+        discussions: Vec<RemoteDiscussion>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.editor.read(cx).rhs_editor().clone();
+        let known: HashSet<String> = editor
+            .read(cx)
+            .review_comments()
+            .into_iter()
+            .filter_map(|comment| comment.thread)
+            .chain(
+                self.held_review_comments
+                    .iter()
+                    .filter_map(|record| record.thread.clone()),
+            )
+            .map(|thread| thread.discussion_id)
+            .collect();
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let buffers_by_path: HashMap<
+            String,
+            (
+                Arc<RelPath>,
+                language::BufferSnapshot,
+                buffer_diff::BufferDiffSnapshot,
+            ),
+        > = self
+            .buffer_subscriptions
+            .iter()
+            .filter_map(|(path, subscription)| {
+                let buffer = subscription.display_buffer.read(cx);
+                Some((
+                    path.as_unix_str().to_string(),
+                    (
+                        buffer.file()?.path().clone(),
+                        buffer.snapshot(),
+                        subscription._diff.read(cx).snapshot(cx),
+                    ),
+                ))
+            })
+            .collect();
+        let last_review_at = self
+            .merge_request
+            .as_ref()
+            .and_then(|header| header.last_review.as_ref())
+            .map(|review| review.at);
+
+        editor.update(cx, |editor, cx| {
+            for discussion in discussions {
+                let Some(first) = discussion.notes.first() else {
+                    continue;
+                };
+                let replies: Vec<ReviewReply> = discussion
+                    .notes
+                    .iter()
+                    .skip(1)
+                    .map(|note| ReviewReply {
+                        author: note.author.clone().into(),
+                        body: note.body.clone(),
+                    })
+                    .collect();
+                let since_last_review = last_review_at.is_some_and(|at| {
+                    discussion
+                        .created_at
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                        .is_some_and(|created| created > at)
+                });
+                if known.contains(&discussion.id) {
+                    editor.set_review_thread_state(
+                        &discussion.id,
+                        replies,
+                        discussion.resolved,
+                        since_last_review,
+                        window,
+                        cx,
+                    );
+                    continue;
+                }
+                // A thread on lines the diff does not show is left out.
+                let Some((file_path, buffer, diff)) = buffers_by_path.get(&discussion.path) else {
+                    continue;
+                };
+                // A thread on removed lines sits where they were removed
+                // from, and says which old line it was on.
+                let (start_row, end_row, old_line) = if discussion.old_side {
+                    let row = new_row_for_old_row(diff, buffer, discussion.line.saturating_sub(1));
+                    (row, row, Some(discussion.line))
+                } else {
+                    (
+                        discussion.start_line.saturating_sub(1),
+                        discussion.line.saturating_sub(1),
+                        None,
+                    )
+                };
+                // A thread opened on lines the diff no longer shows, because
+                // the branch moved on, sits at the nearest shown line of its
+                // file and says where it was.
+                let (range, original_line) =
+                    match anchor_range_for_rows(&snapshot, buffer, start_row, end_row) {
+                        Some(range) => (range, None),
+                        None => {
+                            let Some(row) = nearest_shown_row(&snapshot, buffer, end_row) else {
+                                continue;
+                            };
+                            let Some(range) = anchor_range_for_rows(&snapshot, buffer, row, row)
+                            else {
+                                continue;
+                            };
+                            (range, Some(discussion.line))
+                        }
+                    };
+                editor.add_review_comment_at(
+                    file_path.clone(),
+                    range,
+                    first.body.clone(),
+                    Some(first.author.clone().into()),
+                    Some(ReviewThread {
+                        discussion_id: discussion.id.clone(),
+                        replies,
+                        resolved: discussion.resolved,
+                        original_line,
+                        old_line,
+                        since_last_review,
+                    }),
+                    window,
+                    cx,
+                );
+            }
+        });
     }
 
     /// The stored review comments, each resolved to its file and the last
@@ -821,6 +2072,7 @@ impl DiffMultibuffer {
             .read(cx)
             .review_comments()
             .into_iter()
+            .filter(|comment| comment.thread.is_none())
             .filter_map(|comment| {
                 let start = comment.range.start.to_point(&snapshot);
                 let mut end = comment.range.end.to_point(&snapshot);
@@ -828,12 +2080,20 @@ impl DiffMultibuffer {
                 if end.row > start.row && end.column == 0 {
                     end.row -= 1;
                 }
-                let (buffer, point) = snapshot.point_to_buffer_point(end)?;
+                let (buffer, end_point) = snapshot.point_to_buffer_point(end)?;
                 let path = paths_by_buffer.get(&buffer.remote_id())?;
+                let buffer_id = buffer.remote_id();
+                // The range starts in the same file unless it straddles two
+                // excerpts, in which case only its last line is used.
+                let start_row = snapshot
+                    .point_to_buffer_point(start)
+                    .filter(|(start_buffer, _)| start_buffer.remote_id() == buffer_id)
+                    .map_or(end_point.row, |(_, start_point)| start_point.row);
                 Some(GitLabComment {
                     id: comment.id,
                     path: path.as_unix_str().to_string(),
-                    line: point.row + 1,
+                    start_line: start_row.min(end_point.row) + 1,
+                    line: end_point.row + 1,
                     body: comment.text,
                 })
             })
@@ -951,14 +2211,20 @@ impl DiffMultibuffer {
                             height: Some(1),
                             style: BlockStyle::Flex,
                             render: Arc::new(move |cx| {
+                                // A tinted band with an accent edge, so the
+                                // note reads apart from the code around it.
+                                let colors = cx.theme().colors();
                                 h_flex()
                                     .id(cx.block_id)
                                     .h(cx.line_height)
                                     .w_full()
                                     .pl(cx.margins.gutter.width)
-                                    .gap_1p5()
+                                    .pr_2()
+                                    .gap_2()
                                     .overflow_hidden()
-                                    .bg(cx.theme().colors().editor_background)
+                                    .border_l_2()
+                                    .border_color(colors.text_accent)
+                                    .bg(colors.text_accent.opacity(0.12))
                                     .child(
                                         Icon::new(IconName::Sparkle)
                                             .size(IconSize::Small)
@@ -966,8 +2232,8 @@ impl DiffMultibuffer {
                                     )
                                     .child(
                                         Label::new(text.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
+                                            .size(LabelSize::Default)
+                                            .color(Color::Default)
                                             .italic(),
                                     )
                                     .into_any_element()
@@ -997,18 +2263,22 @@ impl DiffMultibuffer {
                             .id(cx.block_id)
                             .h(cx.line_height)
                             .w_full()
-                            .ml(cx.margins.gutter.width)
+                            .pl(cx.margins.gutter.width)
+                            .pr_2()
                             .gap_2()
-                            .bg(cx.theme().colors().editor_background)
+                            .border_l_2()
+                            .border_color(cx.theme().colors().text_accent)
+                            .bg(cx.theme().colors().text_accent.opacity(0.12))
                             .child(
                                 Label::new(format!("{} of {}", index + 1, total))
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::Default)
+                                    .weight(FontWeight::SEMIBOLD)
                                     .color(Color::Accent),
                             )
                             .child(
                                 Label::new(reason.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                    .size(LabelSize::Default)
+                                    .color(Color::Default),
                             )
                             .into_any_element()
                     }),
@@ -1451,7 +2721,7 @@ impl DiffMultibuffer {
                 })?;
             }
         }
-        this.update(cx, |this, cx| {
+        this.update_in(cx, |this, window, cx| {
             if !buffers_to_fold.is_empty() {
                 this.editor.update(cx, |editor, cx| {
                     editor
@@ -1461,6 +2731,7 @@ impl DiffMultibuffer {
             }
             this.pending_scroll.take();
             this.update_review_order_blocks(cx);
+            this.restore_held_review_comments(window, cx);
             cx.notify();
         })?;
 
@@ -1645,6 +2916,11 @@ impl Render for DiffMultibuffer {
             .track_focus(&self.focus_handle)
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
             .bg(cx.theme().colors().editor_background)
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DraggedDescriptionEdge>, window, cx| {
+                    this.drag_description_edge(event, window, cx)
+                },
+            ))
             .flex()
             .items_center()
             .justify_center()
@@ -1710,6 +2986,77 @@ impl Render for DiffMultibuffer {
                 )
             })
     }
+}
+
+/// Multibuffer anchors from the start of `start_row` to the end of `end_row`
+/// in `buffer`, if the diff shows those lines.
+fn anchor_range_for_rows(
+    snapshot: &multi_buffer::MultiBufferSnapshot,
+    buffer: &language::BufferSnapshot,
+    start_row: u32,
+    end_row: u32,
+) -> Option<std::ops::Range<multi_buffer::Anchor>> {
+    let max_row = buffer.max_point().row;
+    let start_row = start_row.min(max_row);
+    let end_row = end_row.min(max_row).max(start_row);
+    let start = snapshot.anchor_in_excerpt(buffer.anchor_before(Point::new(start_row, 0)))?;
+    let end = snapshot
+        .anchor_in_excerpt(buffer.anchor_before(Point::new(end_row, buffer.line_len(end_row))))?;
+    Some(start..end)
+}
+
+/// The row of the new version of the file that the old row `old_row` maps
+/// to: the same line when the change kept it, or the first row of the hunk
+/// that removed it.
+fn new_row_for_old_row(
+    diff: &buffer_diff::BufferDiffSnapshot,
+    buffer: &language::BufferSnapshot,
+    old_row: u32,
+) -> u32 {
+    let base_text = diff.base_text();
+    let mut delta: i64 = 0;
+    for hunk in diff.hunks(buffer) {
+        let old_start = base_text
+            .offset_to_point(hunk.diff_base_byte_range.start)
+            .row;
+        let old_end = base_text.offset_to_point(hunk.diff_base_byte_range.end).row;
+        let new_start = hunk.range.start.row;
+        let new_end = hunk.range.end.row;
+        if old_row < old_start {
+            break;
+        }
+        if old_row < old_end {
+            return new_start.min(buffer.max_point().row);
+        }
+        delta = i64::from(new_end) - i64::from(old_end);
+    }
+    (i64::from(old_row) + delta)
+        .clamp(0, i64::from(buffer.max_point().row))
+        .try_into()
+        .unwrap_or(0)
+}
+
+/// Seconds since the Unix epoch for one of GitLab's ISO 8601 timestamps.
+fn parse_timestamp(text: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|time| time.unix_timestamp())
+}
+
+/// The shown row of `buffer` closest to `row`, when the diff shows any of it.
+fn nearest_shown_row(
+    snapshot: &multi_buffer::MultiBufferSnapshot,
+    buffer: &language::BufferSnapshot,
+    row: u32,
+) -> Option<u32> {
+    snapshot
+        .excerpts_for_buffer(buffer.remote_id())
+        .map(|excerpt| {
+            let start = excerpt.context.start.to_point(buffer).row;
+            let end = excerpt.context.end.to_point(buffer).row;
+            row.clamp(start, end)
+        })
+        .min_by_key(|candidate| candidate.abs_diff(row))
 }
 
 /// A single user message asking the model for `prompt`.

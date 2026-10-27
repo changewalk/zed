@@ -55,6 +55,9 @@ actions!(
         Add,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
+        /// Opens a new agent thread with the branch diff, the merge request,
+        /// and the reading order in the message box, ready for a question.
+        AskAboutDiff,
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
@@ -66,6 +69,21 @@ actions!(
         /// Posts the review comments as inline discussions on the open
         /// GitLab merge request of the current branch, through `glab`.
         PostReviewToGitLab,
+        /// Pulls the merge request's threads and replies into the diff.
+        RefreshReviewThreads,
+        /// Opens the box for the summary comment that finishes the review,
+        /// with approve and request changes buttons.
+        FinishReview,
+        /// Approves the merge request, or withdraws the approval.
+        ApproveMergeRequest,
+        /// Folds the merge request description above the diff, or unfolds it.
+        ToggleMergeRequestDescription,
+        /// Records the current tip of the branch as reviewed, so the next
+        /// visit can show only what changed since.
+        MarkReviewed,
+        /// Diffs against the commit last reviewed, so only what changed
+        /// since is shown, or back against the usual base.
+        ToggleChangesSinceReview,
     ]
 );
 
@@ -333,11 +351,6 @@ impl ProjectDiff {
 
     pub fn calculate_changed_lines(&self, cx: &App) -> (u32, u32) {
         self.diff.read(cx).calculate_changed_lines(cx)
-    }
-
-    /// Returns the total count of review comments across all hunks/files.
-    pub fn total_review_comment_count(&self, cx: &App) -> usize {
-        self.diff.read(cx).total_review_comment_count()
     }
 
     /// Returns the splittable editor of the currently-shown diff view.
@@ -632,11 +645,61 @@ impl ProjectDiff {
     fn post_review_to_gitlab(
         &mut self,
         _: &PostReviewToGitLab,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.diff
-            .update(cx, |diff, cx| diff.post_review_to_gitlab(cx));
+            .update(cx, |diff, cx| diff.post_review_to_gitlab(window, cx));
+    }
+
+    fn refresh_review_threads(
+        &mut self,
+        _: &RefreshReviewThreads,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.sync_review_threads(window, cx));
+    }
+
+    fn finish_review(&mut self, _: &FinishReview, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_review_summary(window, cx));
+    }
+
+    fn approve_merge_request(
+        &mut self,
+        _: &ApproveMergeRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            diff.finish_review(crate::diff_multibuffer::ReviewVerdict::Approve, window, cx)
+        });
+    }
+
+    fn mark_reviewed(&mut self, _: &MarkReviewed, _: &mut Window, cx: &mut Context<Self>) {
+        self.diff.update(cx, |diff, cx| diff.mark_reviewed(cx));
+    }
+
+    fn toggle_merge_request_description(
+        &mut self,
+        _: &ToggleMergeRequestDescription,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
+    }
+
+    fn toggle_changes_since_review(
+        &mut self,
+        _: &ToggleChangesSinceReview,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.toggle_changes_since_review(cx));
     }
 }
 
@@ -647,6 +710,12 @@ impl Render for ProjectDiff {
             .on_action(cx.listener(Self::suggest_review_order))
             .on_action(cx.listener(Self::clear_review_order))
             .on_action(cx.listener(Self::post_review_to_gitlab))
+            .on_action(cx.listener(Self::refresh_review_threads))
+            .on_action(cx.listener(Self::finish_review))
+            .on_action(cx.listener(Self::approve_merge_request))
+            .on_action(cx.listener(Self::mark_reviewed))
+            .on_action(cx.listener(Self::toggle_merge_request_description))
+            .on_action(cx.listener(Self::toggle_changes_since_review))
             .child(self.diff.clone())
     }
 }
@@ -878,7 +947,11 @@ impl Render for ProjectDiffToolbar {
         };
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
-        let review_count = project_diff.read(cx).total_review_comment_count(cx);
+        let review_count = project_diff
+            .read(cx)
+            .diff
+            .read(cx)
+            .unposted_review_comment_count(cx);
 
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let is_multibuffer_empty = project_diff.read(cx).multibuffer(cx).read(cx).is_empty();
@@ -1048,7 +1121,103 @@ impl Render for ProjectDiffToolbar {
                             })),
                     )
             })
+            .children(render_review_buttons(
+                project_diff.read(cx).diff.read(cx),
+                &focus_handle,
+                cx,
+            ))
     }
+}
+
+/// The buttons that need a merge request: one that diffs against the
+/// commit last reviewed when the branch has moved on since, and one that
+/// finishes the review.
+pub(crate) fn render_review_buttons(
+    diff: &DiffMultibuffer,
+    focus_handle: &FocusHandle,
+    cx: &App,
+) -> Vec<AnyElement> {
+    if !diff.has_merge_request() {
+        return Vec::new();
+    }
+    let mut buttons = vec![Divider::vertical().into_any_element()];
+    if let Some((review, showing)) = diff.changes_since_review(cx) {
+        let short_sha: String = review.head_sha.chars().take(7).collect();
+        let (label, tooltip) = if showing {
+            (
+                "Show Whole Diff".to_string(),
+                "Diff against the usual base again".to_string(),
+            )
+        } else {
+            (
+                format!("Since My Review ({short_sha})"),
+                format!("Diff against {short_sha}, the commit you last reviewed"),
+            )
+        };
+        buttons.push(
+            Button::new("changes-since-review", label)
+                .toggle_state(showing)
+                .start_icon(
+                    Icon::new(IconName::Diff)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::for_action_title_in(
+                    tooltip,
+                    &ToggleChangesSinceReview,
+                    focus_handle,
+                ))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(ToggleChangesSinceReview.boxed_clone(), cx)
+                })
+                .into_any_element(),
+        );
+    }
+    if let Some((approved, busy)) = diff.approval_state() {
+        let (label, tooltip) = if approved {
+            ("Unapprove", "Withdraw your approval of the merge request")
+        } else {
+            ("Approve", "Approve the merge request")
+        };
+        buttons.push(
+            Button::new("approve-merge-request", label)
+                .style(ButtonStyle::Filled)
+                .toggle_state(approved)
+                .disabled(busy)
+                .start_icon(Icon::new(IconName::ThumbsUp).size(IconSize::Small).color(
+                    if approved {
+                        Color::Success
+                    } else {
+                        Color::Muted
+                    },
+                ))
+                .tooltip(Tooltip::for_action_title_in(
+                    tooltip,
+                    &ApproveMergeRequest,
+                    focus_handle,
+                ))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(ApproveMergeRequest.boxed_clone(), cx)
+                })
+                .into_any_element(),
+        );
+    }
+    buttons.push(
+        Button::new("finish-review", "Finish Review")
+            .start_icon(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .tooltip(Tooltip::for_action_title_in(
+                "Write a summary, then approve or request changes",
+                &FinishReview,
+                focus_handle,
+            ))
+            .on_click(|_, window, cx| window.dispatch_action(FinishReview.boxed_clone(), cx))
+            .into_any_element(),
+    );
+    buttons
 }
 
 /// The toolbar button for the review order, with the action a click sends.
@@ -2416,6 +2585,7 @@ mod tests {
     async fn test_review_order_sorts_listed_files_first(cx: &mut TestAppContext) {
         use crate::review_order::{ReviewNote, ReviewOrder, ReviewOrderEntry};
         use git::repository::repo_path;
+        use multi_buffer::ToPoint as _;
 
         init_test(cx);
 
@@ -2475,6 +2645,29 @@ mod tests {
                 notes: Vec::new(),
             },
         ]);
+        // A comment on `c.rs`, the last excerpt, must survive the re-sort
+        // that moves it first.
+        let editor = diff.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let row = snapshot
+                .text()
+                .lines()
+                .position(|line| line == "C")
+                .expect("c.rs is in the diff") as u32;
+            let range = snapshot.anchor_before(language::Point::new(row, 0))
+                ..snapshot.anchor_before(language::Point::new(row, 1));
+            let file_path = Arc::from(util::rel_path::RelPath::from_unix_str("c.rs").unwrap());
+            editor.add_review_comment_at(
+                file_path,
+                range,
+                "Check this.".into(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
         diff.update_in(cx, |diff, window, cx| {
             diff.set_review_order(Some(Arc::new(order)), window, cx)
         });
@@ -2484,6 +2677,24 @@ mod tests {
         // Two file headers plus two notes.
         let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
         assert_eq!(blocks, 4);
+        let comments = editor.read_with(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            editor
+                .review_comments()
+                .into_iter()
+                .map(|comment| {
+                    (
+                        comment.file_path.as_unix_str().to_string(),
+                        comment.range.start.to_point(&snapshot).row,
+                        comment.text,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            comments,
+            vec![("c.rs".to_string(), 0, "Check this.".to_string())]
+        );
 
         // Clearing the order restores the path sort.
         diff.update_in(cx, |diff, window, cx| {

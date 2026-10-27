@@ -33,8 +33,10 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     const NAME: &'static str = "diff-review";
     type Value = PresenceFlag;
 
-    fn enabled_for_staff() -> bool {
-        false
+    // The review comments are the input to the GitLab posting flow, which is
+    // not reachable through the server-side flag, so the fork enables them.
+    fn enabled_for_all() -> bool {
+        true
     }
 }
 register_feature_flag!(DiffReviewFeatureFlag);

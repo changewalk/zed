@@ -111,7 +111,6 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
-pub use git::ReviewCommentSnapshot;
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
@@ -120,6 +119,7 @@ pub use git::{
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
+pub use git::{ReviewCommentRecord, ReviewCommentSnapshot, ReviewReply, ReviewThread};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 pub use inline_input::InlineInputState;
@@ -12616,6 +12616,23 @@ pub enum EditorEvent {
     ReviewCommentsChanged {
         /// The new total count of review comments.
         total_count: usize,
+    },
+    /// The user wrote a reply under a posted review comment and asked for
+    /// it to be sent.
+    ReviewReplySubmitted {
+        comment_id: usize,
+        discussion_id: String,
+        body: String,
+    },
+    /// The user asked for a posted thread to be resolved or reopened.
+    ReviewThreadResolveRequested {
+        discussion_id: String,
+        resolved: bool,
+    },
+    /// The user asked for a drafted reply to a posted thread.
+    ReviewReplyDraftRequested {
+        comment_id: usize,
+        discussion_id: String,
     },
     InputIgnored {
         text: Arc<str>,

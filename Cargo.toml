@@ -900,6 +900,7 @@ serde_path_to_error = "0.1.17"
 serde_urlencoded = "0.7"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 serde_yaml_ng = "0.10"
+sha1 = "0.10"
 sha2 = "0.10"
 shellexpand = "3.1"
 shlex = "2.0"
