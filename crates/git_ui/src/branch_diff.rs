@@ -3,10 +3,11 @@ use crate::{
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
         self, ApproveMergeRequest, AskAboutDiff, ClearReviewOrder, CompareWithBranch,
-        DeployBranchDiff, FinishReview, MarkReviewed, PostReviewToGitLab, ProjectDiff,
-        RefreshReviewThreads, ReviewDiff, SuggestReviewOrder, ToggleChangesSinceReview,
-        ToggleMergeRequestDescription, render_post_review_to_gitlab_button, render_review_buttons,
-        render_review_order_button, render_send_review_to_agent_button,
+        DeployBranchDiff, FinishReview, GoToReviewComment, MarkReviewed, NextReviewComment,
+        PostReviewToGitLab, PreviousReviewComment, ProjectDiff, RefreshReviewThreads, ReviewDiff,
+        SuggestReviewOrder, ToggleChangesSinceReview, ToggleMergeRequestDescription,
+        render_post_review_to_gitlab_button, render_review_buttons, render_review_order_button,
+        render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
@@ -343,11 +344,17 @@ impl BranchDiff {
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
             if let Some(review) = review {
+                // The view is being reused for another branch, so nothing
+                // of the previous review may linger: not the header, not the
+                // order, not the threads, and not the primed thread.
                 existing.update(cx, |item, cx| {
                     item.diff.update(cx, |diff, cx| {
+                        diff.reset_review(window, cx);
                         diff.load_merge_request(review.merge_request_file, cx);
                         diff.suggest_review_order_when_loaded(window, cx)
                     });
+                    item.ask_thread_prepared = false;
+                    item._prepare_ask_thread_task.take();
                     item.prepare_ask_thread_when_ordered(window, cx);
                 });
                 Self::close_other_tabs(workspace, window, cx);
@@ -749,6 +756,37 @@ impl BranchDiff {
             .update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
     }
 
+    fn next_review_comment(
+        &mut self,
+        _: &NextReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.go_to_review_comment(true, window, cx));
+    }
+
+    fn previous_review_comment(
+        &mut self,
+        _: &PreviousReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.go_to_review_comment(false, window, cx));
+    }
+
+    fn go_to_review_comment(
+        &mut self,
+        action: &GoToReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            diff.go_to_review_comment_id(action.id, window, cx)
+        });
+    }
+
     fn toggle_changes_since_review(
         &mut self,
         _: &ToggleChangesSinceReview,
@@ -805,7 +843,9 @@ impl Item for BranchDiff {
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.diff_base(cx) {
-            DiffBase::Merge { base_ref } => format!("Changes since {}", base_ref).into(),
+            DiffBase::Merge { base_ref } => {
+                format!("Changes since {}", display_ref(base_ref)).into()
+            }
             DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Changes".into(),
         }
     }
@@ -974,6 +1014,9 @@ impl Render for BranchDiff {
             .on_action(cx.listener(Self::mark_reviewed))
             .on_action(cx.listener(Self::toggle_merge_request_description))
             .on_action(cx.listener(Self::toggle_changes_since_review))
+            .on_action(cx.listener(Self::next_review_comment))
+            .on_action(cx.listener(Self::previous_review_comment))
+            .on_action(cx.listener(Self::go_to_review_comment))
             .child(self.diff.clone())
     }
 }
@@ -1091,6 +1134,17 @@ impl ToolbarItemView for BranchDiffToolbar {
     }
 }
 
+/// A ref as a label: a full commit hash, which a review launched on
+/// GitLab's base commit uses, is cut to its first eight characters.
+fn display_ref(base_ref: &str) -> String {
+    let is_hash = base_ref.len() >= 20 && base_ref.chars().all(|c| c.is_ascii_hexdigit());
+    if is_hash {
+        base_ref.chars().take(8).collect()
+    } else {
+        base_ref.to_string()
+    }
+}
+
 impl Render for BranchDiffToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(branch_diff) = self.branch_diff(cx) else {
@@ -1112,7 +1166,7 @@ impl Render for BranchDiffToolbar {
             return div();
         };
         let selected_base_ref = base_ref.clone();
-        let base_ref_label = format!("Base: {base_ref}");
+        let base_ref_label = format!("Base: {}", display_ref(&base_ref));
         let repository = branch_diff.read(cx).repo(cx);
         let workspace = branch_diff.read(cx).workspace.clone();
         let project = branch_diff.read(cx).project.clone();
@@ -1260,7 +1314,7 @@ impl Render for BranchDiffToolbar {
                     )
             })
             .children(render_review_buttons(
-                branch_diff.read(cx).diff.read(cx),
+                &branch_diff.read(cx).diff,
                 &focus_handle,
                 cx,
             ))

@@ -31,7 +31,7 @@ use serde::Deserialize;
 use settings::{GitDiffBaseSetting, Settings as _};
 use std::any::{Any, TypeId};
 use std::sync::Arc;
-use ui::{DiffStat, Divider, Tooltip, prelude::*};
+use ui::{ContextMenu, DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
@@ -78,6 +78,10 @@ actions!(
         ApproveMergeRequest,
         /// Folds the merge request description above the diff, or unfolds it.
         ToggleMergeRequestDescription,
+        /// Moves to the next review comment in the diff, wrapping round.
+        NextReviewComment,
+        /// Moves to the previous review comment in the diff, wrapping round.
+        PreviousReviewComment,
         /// Records the current tip of the branch as reviewed, so the next
         /// visit can show only what changed since.
         MarkReviewed,
@@ -92,6 +96,14 @@ actions!(
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = git, name = "DiffBranch", deprecated_aliases = ["git::BranchDiff"])]
 pub(crate) struct DeployBranchDiff;
+
+/// Moves to the review comment with the given id.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct GoToReviewComment {
+    pub id: usize,
+}
 
 pub struct ProjectDiff {
     project: Entity<Project>,
@@ -692,6 +704,37 @@ impl ProjectDiff {
             .update(cx, |diff, cx| diff.toggle_merge_request_description(cx));
     }
 
+    fn next_review_comment(
+        &mut self,
+        _: &NextReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.go_to_review_comment(true, window, cx));
+    }
+
+    fn previous_review_comment(
+        &mut self,
+        _: &PreviousReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff
+            .update(cx, |diff, cx| diff.go_to_review_comment(false, window, cx));
+    }
+
+    fn go_to_review_comment(
+        &mut self,
+        action: &GoToReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.diff.update(cx, |diff, cx| {
+            diff.go_to_review_comment_id(action.id, window, cx)
+        });
+    }
+
     fn toggle_changes_since_review(
         &mut self,
         _: &ToggleChangesSinceReview,
@@ -716,6 +759,9 @@ impl Render for ProjectDiff {
             .on_action(cx.listener(Self::mark_reviewed))
             .on_action(cx.listener(Self::toggle_merge_request_description))
             .on_action(cx.listener(Self::toggle_changes_since_review))
+            .on_action(cx.listener(Self::next_review_comment))
+            .on_action(cx.listener(Self::previous_review_comment))
+            .on_action(cx.listener(Self::go_to_review_comment))
             .child(self.diff.clone())
     }
 }
@@ -1122,7 +1168,7 @@ impl Render for ProjectDiffToolbar {
                     )
             })
             .children(render_review_buttons(
-                project_diff.read(cx).diff.read(cx),
+                &project_diff.read(cx).diff,
                 &focus_handle,
                 cx,
             ))
@@ -1133,14 +1179,80 @@ impl Render for ProjectDiffToolbar {
 /// commit last reviewed when the branch has moved on since, and one that
 /// finishes the review.
 pub(crate) fn render_review_buttons(
-    diff: &DiffMultibuffer,
+    diff_entity: &Entity<DiffMultibuffer>,
     focus_handle: &FocusHandle,
     cx: &App,
 ) -> Vec<AnyElement> {
-    if !diff.has_merge_request() {
-        return Vec::new();
+    let diff = diff_entity.read(cx);
+    let mut buttons = Vec::new();
+    if let Some((_, total)) = diff.review_comment_position(cx) {
+        let entries = diff.review_comment_entries(cx);
+        let diff_for_menu = diff_entity.downgrade();
+        let open = entries
+            .iter()
+            .filter(|entry| entry.posted && !entry.resolved)
+            .count();
+        let label = format!("{total} comment{}", if total == 1 { "" } else { "s" });
+        buttons.push(Divider::vertical().into_any_element());
+        buttons.push(
+            PopoverMenu::new("review-comments-overview")
+                .menu(move |window, cx| {
+                    let entries = entries.clone();
+                    let diff_for_menu = diff_for_menu.clone();
+                    Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                        menu = menu.header(format!("{total} comments, {open} open"));
+                        for entry in entries {
+                            let mark = if !entry.posted {
+                                "✎"
+                            } else if entry.resolved {
+                                "✓"
+                            } else {
+                                "○"
+                            };
+                            let replies = if entry.replies > 0 {
+                                format!(" (+{})", entry.replies)
+                            } else {
+                                String::new()
+                            };
+                            let file = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                            let label = format!(
+                                "{mark} {} · {file}:{}{replies} — {}",
+                                entry.author, entry.line, entry.snippet
+                            );
+                            let id = entry.id;
+                            // The menu holds focus while it is open, so an
+                            // action dispatched from it would not reach the
+                            // diff view; the view is updated directly.
+                            let diff = diff_for_menu.clone();
+                            menu = menu.entry(label, None, move |window, cx| {
+                                diff.update(cx, |diff, cx| {
+                                    diff.go_to_review_comment_id(id, window, cx)
+                                })
+                                .ok();
+                            });
+                        }
+                        menu
+                    }))
+                })
+                .trigger_with_tooltip(
+                    Button::new("review-comments-position", label).start_icon(
+                        Icon::new(IconName::Chat)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    ),
+                    Tooltip::for_action_title_in(
+                        "Every comment on the merge request; n and shift-n step through them",
+                        &NextReviewComment,
+                        focus_handle,
+                    ),
+                )
+                .into_any_element(),
+        );
     }
-    let mut buttons = vec![Divider::vertical().into_any_element()];
+    if !diff.has_merge_request() {
+        return buttons;
+    }
+    buttons.push(Divider::vertical().into_any_element());
     if let Some((review, showing)) = diff.changes_since_review(cx) {
         let short_sha: String = review.head_sha.chars().take(7).collect();
         let (label, tooltip) = if showing {
@@ -2674,9 +2786,10 @@ mod tests {
         cx.run_until_parked();
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
         assert_eq!(paths, vec!["c.rs", "a.rs", "b.rs"]);
-        // Two file headers plus two notes.
+        // Two file headers. `c.rs` has one line, so both of its notes would
+        // sit right under its header and are left out.
         let blocks = diff.read_with(cx, |diff, cx| diff.review_order_block_count(cx));
-        assert_eq!(blocks, 4);
+        assert_eq!(blocks, 2);
         let comments = editor.read_with(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             editor

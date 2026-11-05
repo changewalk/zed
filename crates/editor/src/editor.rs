@@ -12634,6 +12634,13 @@ pub enum EditorEvent {
         comment_id: usize,
         discussion_id: String,
     },
+    /// The user changed the text of a comment that is already on a remote
+    /// thread, so the remote note needs the new text.
+    ReviewCommentEdited {
+        discussion_id: String,
+        note_id: u64,
+        body: String,
+    },
     InputIgnored {
         text: Arc<str>,
     },

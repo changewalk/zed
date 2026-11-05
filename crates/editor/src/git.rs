@@ -181,6 +181,8 @@ pub struct ReviewReply {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct ReviewThread {
     pub discussion_id: String,
+    /// GitLab's id for the opening note, so the comment can be edited there.
+    pub note_id: Option<u64>,
     pub replies: Vec<ReviewReply>,
     pub resolved: bool,
     /// The one-based line the thread was opened on, when the diff no longer
@@ -939,6 +941,7 @@ impl Editor {
         &mut self,
         id: usize,
         discussion_id: String,
+        note_id: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -947,6 +950,7 @@ impl Editor {
             |comment| {
                 comment.thread = Some(ReviewThread {
                     discussion_id,
+                    note_id,
                     ..ReviewThread::default()
                 })
             },
@@ -960,6 +964,7 @@ impl Editor {
     pub fn set_review_thread_state(
         &mut self,
         discussion_id: &str,
+        note_id: Option<u64>,
         replies: Vec<ReviewReply>,
         resolved: bool,
         since_last_review: bool,
@@ -979,6 +984,7 @@ impl Editor {
             },
             |comment| {
                 if let Some(thread) = comment.thread.as_mut() {
+                    thread.note_id = note_id.or(thread.note_id);
                     thread.replies = replies;
                     thread.resolved = resolved;
                     thread.since_last_review = since_last_review;
@@ -1796,19 +1802,38 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> bool {
         let markdown = parse_markdown(self, &new_comment, cx);
+        let mut edited_thread = None;
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(comment) = comments.iter_mut().find(|c| c.id == id) {
                 comment.markdown = markdown;
-                comment.comment = new_comment;
+                comment.comment = new_comment.clone();
                 comment.is_editing = false;
-                cx.emit(EditorEvent::ReviewCommentsChanged {
-                    total_count: self.total_review_comment_count(),
-                });
-                cx.notify();
-                return true;
+                // A comment of the user's own that is already on the remote
+                // is changed there too.
+                if comment.author.is_none()
+                    && let Some(thread) = comment.thread.as_ref()
+                    && let Some(note_id) = thread.note_id
+                {
+                    edited_thread = Some((thread.discussion_id.clone(), note_id));
+                }
+                break;
             }
         }
-        false
+        let Some(_) = self.review_comment(id) else {
+            return false;
+        };
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.total_review_comment_count(),
+        });
+        if let Some((discussion_id, note_id)) = edited_thread {
+            cx.emit(EditorEvent::ReviewCommentEdited {
+                discussion_id,
+                note_id,
+                body: new_comment,
+            });
+        }
+        cx.notify();
+        true
     }
 
     /// Sets a comment's editing state.
@@ -3753,6 +3778,20 @@ impl Editor {
             )
     }
 
+    /// The pencil that opens a comment for editing in place.
+    fn render_edit_comment_button(comment_id: usize, action_icon_size: IconSize) -> IconButton {
+        IconButton::new(format!("diff-review-edit-{comment_id}"), IconName::Pencil)
+            .icon_color(ui::Color::Muted)
+            .icon_size(action_icon_size)
+            .tooltip(Tooltip::text("Edit comment"))
+            .on_click(move |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::actions::EditReviewComment { id: comment_id }),
+                    cx,
+                );
+            })
+    }
+
     fn render_comment_row(
         comment: StoredReviewComment,
         inline_editor: Option<Entity<Editor>>,
@@ -3853,6 +3892,12 @@ impl Editor {
                 h_flex()
                     .gap_1()
                     .items_center()
+                    .when(!is_remote, |el| {
+                        el.child(Self::render_edit_comment_button(
+                            comment_id,
+                            action_icon_size,
+                        ))
+                    })
                     .when(since_last_review, |el| {
                         el.child(
                             Label::new("New since your review")
@@ -3938,9 +3983,33 @@ impl Editor {
                     )
                     .into_any_element()
             } else {
-                Label::new("Not posted")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new("Not posted")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Self::render_edit_comment_button(
+                        comment_id,
+                        action_icon_size,
+                    ))
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-delete-{comment_id}"),
+                            IconName::Trash,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Delete comment"))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::DeleteReviewComment { id: comment_id }),
+                                cx,
+                            );
+                        }),
+                    )
                     .into_any_element()
             });
 

@@ -107,6 +107,19 @@ impl ReviewOrder {
         Self::new(entries)
     }
 
+    /// The same order with one file's notes replaced.
+    pub fn with_file_notes(&self, path: &RepoPath, notes: Vec<ReviewNote>) -> Self {
+        Self::new(self.entries.iter().map(|entry| ReviewOrderEntry {
+            path: entry.path.clone(),
+            reason: entry.reason.clone(),
+            notes: if &entry.path == path {
+                notes.clone()
+            } else {
+                entry.notes.clone()
+            },
+        }))
+    }
+
     /// The same order with each file's notes replaced by `notes`. Files
     /// without an entry in `notes` lose theirs.
     pub fn with_notes(&self, mut notes: ReviewNotes) -> Self {
@@ -207,6 +220,65 @@ fn order_section(description: &str) -> Option<&str> {
         offset += line.len();
     }
     Some(&section[..end])
+}
+
+/// The scheme of the links that `link_file_references` writes: the path,
+/// then `#L<line>` when the reference named one.
+pub(crate) const REVIEW_FILE_SCHEME: &str = "review-file://";
+
+/// `text` as markdown in which every mention of a file of the diff is a
+/// link, so a note can be clicked to go there. A mention is a word that
+/// names exactly one file, by full path or unique suffix, with an optional
+/// `:line` after it.
+pub(crate) fn link_file_references(text: &str, known: &[RepoPath]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        let lead = word.len() - word.trim_start_matches(['(', '`', '"', '\'', '[']).len();
+        let core_end = word
+            .trim_end_matches([')', '`', '"', '\'', ',', '.', ';', ':', ']'])
+            .len();
+        let core = &word[lead..core_end.max(lead)];
+        let (name, line) = match core.rsplit_once(':') {
+            Some((name, line)) if line.chars().all(|c| c.is_ascii_digit()) && !line.is_empty() => {
+                (name, Some(line))
+            }
+            _ => (core, None),
+        };
+        match resolve_path(name, known) {
+            Some(path) if !core.is_empty() => {
+                out.push_str(&word[..lead]);
+                out.push('[');
+                out.push_str(core);
+                out.push_str("](");
+                out.push_str(REVIEW_FILE_SCHEME);
+                out.push_str(path.as_unix_str());
+                if let Some(line) = line {
+                    out.push_str("#L");
+                    out.push_str(line);
+                }
+                out.push(')');
+                out.push_str(&word[core_end.max(lead)..]);
+            }
+            _ => out.push_str(word),
+        }
+        let space_end = after.len() - after.trim_start().len();
+        out.push_str(&after[..space_end]);
+        rest = &after[space_end..];
+    }
+    out
+}
+
+/// The file and line a link from `link_file_references` points at.
+pub(crate) fn parse_review_file_url(url: &str) -> Option<(RepoPath, Option<u32>)> {
+    let rest = url.strip_prefix(REVIEW_FILE_SCHEME)?;
+    let (path, line) = match rest.split_once("#L") {
+        Some((path, line)) => (path, line.parse().ok()),
+        None => (rest, None),
+    };
+    Some((RepoPath::new(path).ok()?, line))
 }
 
 /// The file of the diff that `token` names, if exactly one does.
@@ -432,7 +504,13 @@ fn truncate_to_lines(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text.trim_end();
     }
-    let cut = text[..max_bytes].rfind('\n').unwrap_or(0);
+    // The limit may fall inside a multi-byte character; back up to the
+    // start of it before looking for the line break.
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let cut = text[..boundary].rfind('\n').unwrap_or(0);
     text[..cut].trim_end()
 }
 
@@ -513,8 +591,104 @@ pub(crate) fn parse_review_order(text: &str, known_paths: &[RepoPath]) -> Result
     )))
 }
 
-/// Reads the notes reply into notes keyed by file. Files with no usable
-/// notes are left out.
+/// Reads a notes reply as it streams in, giving out each file's notes as
+/// soon as its JSON object is complete, so the first files of the order
+/// get their notes while the model is still writing the rest.
+#[derive(Default)]
+pub(crate) struct NotesStreamParser {
+    buffer: String,
+    /// Where the next unread object can start.
+    offset: usize,
+    in_array: bool,
+    seen: HashSet<RepoPath>,
+}
+
+impl NotesStreamParser {
+    /// Adds `chunk` and returns the files whose notes are now complete.
+    pub(crate) fn push(
+        &mut self,
+        chunk: &str,
+        known_paths: &[RepoPath],
+    ) -> Vec<(RepoPath, Vec<ReviewNote>)> {
+        self.buffer.push_str(chunk);
+        let mut ready = Vec::new();
+        loop {
+            if !self.in_array {
+                match self.buffer[self.offset..].find('[') {
+                    Some(index) => {
+                        self.offset += index + 1;
+                        self.in_array = true;
+                    }
+                    None => return ready,
+                }
+            }
+            let Some((start, end)) = next_object(&self.buffer[self.offset..]) else {
+                return ready;
+            };
+            let object = &self.buffer[self.offset + start..self.offset + end];
+            self.offset += end;
+            if let Ok(entry) = serde_json::from_str::<RawEntry>(object)
+                && let Some(path) = known_paths
+                    .iter()
+                    .find(|path| path.as_unix_str() == entry.path.trim().trim_start_matches("./"))
+                && self.seen.insert(path.clone())
+            {
+                let notes = notes_of(entry);
+                if !notes.is_empty() {
+                    ready.push((path.clone(), notes));
+                }
+            }
+        }
+    }
+
+    /// How many files have had notes so far.
+    pub(crate) fn files_seen(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+/// The byte range of the first complete `{…}` object in `text`, if one
+/// is there, skipping braces inside strings.
+fn next_object(text: &str) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, c) in text.char_indices() {
+        if in_string {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => in_string = false,
+                _ => escaped = false,
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0
+                    && let Some(start) = start
+                {
+                    return Some((start, index + c.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads a whole notes reply into notes keyed by file. Files with no
+/// usable notes are left out. The live path streams instead; this stays
+/// for the tests of the shared parsing.
+#[cfg(test)]
 pub(crate) fn parse_review_notes(text: &str, known_paths: &[RepoPath]) -> Result<ReviewNotes> {
     let entries = parse_entries(text, known_paths)?;
     Ok(entries
@@ -587,6 +761,68 @@ mod tests {
         );
         assert_eq!(combined.entries()[0].reason.as_ref(), "the decision");
         assert_eq!(combined.entries()[5].reason.as_ref(), "model");
+    }
+
+    #[test]
+    fn file_mentions_in_notes_become_links_with_their_line() {
+        let known: Vec<RepoPath> = ["src/client.rs", "src/loop.rs", "docs/a.md"]
+            .iter()
+            .map(|path| RepoPath::new(path).unwrap())
+            .collect();
+        let linked = link_file_references(
+            "The callers in src/client.rs:41 rely on it (see `loop.rs`), not docs.",
+            &known,
+        );
+        assert_eq!(
+            linked,
+            "The callers in [src/client.rs:41](review-file://src/client.rs#L41) rely on it \
+             (see `[loop.rs](review-file://src/loop.rs)`), not docs."
+        );
+        assert_eq!(
+            parse_review_file_url("review-file://src/client.rs#L41"),
+            Some((RepoPath::new("src/client.rs").unwrap(), Some(41)))
+        );
+        assert_eq!(
+            parse_review_file_url("review-file://src/loop.rs"),
+            Some((RepoPath::new("src/loop.rs").unwrap(), None))
+        );
+        assert_eq!(parse_review_file_url("https://x"), None);
+    }
+
+    #[test]
+    fn notes_stream_gives_each_file_as_its_object_completes() {
+        let known = vec![
+            RepoPath::new("a.rs").unwrap(),
+            RepoPath::new("b.rs").unwrap(),
+        ];
+        let mut parser = NotesStreamParser::default();
+        assert!(
+            parser
+                .push(
+                    "Sure:\n[\n  {\"path\": \"a.rs\", \"notes\": [{\"line\": 3, \"no",
+                    &known
+                )
+                .is_empty()
+        );
+        let first = parser.push("te\": \"A } brace in text\"}]},\n  {\"path\": \"b.", &known);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0.as_unix_str(), "a.rs");
+        assert_eq!(first[0].1[0].text.as_ref(), "A } brace in text");
+        let second = parser.push(
+            "rs\", \"notes\": [{\"line\": 9, \"note\": \"B\"}]}\n]",
+            &known,
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0.as_unix_str(), "b.rs");
+        assert_eq!(parser.files_seen(), 2);
+        assert!(parser.push("", &known).is_empty());
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let text = "first line\nsecond — dash\nthird";
+        assert_eq!(truncate_to_lines(text, 19), "first line");
+        assert_eq!(truncate_to_lines("short", 100), "short");
     }
 
     #[test]

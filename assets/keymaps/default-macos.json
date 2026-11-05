@@ -356,7 +356,7 @@
       "shift-alt-y": "agent::KeepAll",
       "shift-alt-z": "agent::RejectAll",
       "shift-alt-u": "agent::UndoLastReject",
-      "cmd-enter": "agent::ChatWithFollow",
+      "cmd-enter": "agent::Chat",
       "cmd-shift-enter": "agent::SendImmediately",
       "cmd-shift-alt-enter": "agent::SendNextQueuedMessage",
       "cmd-shift-backspace": "agent::RemoveFirstQueuedMessage",
@@ -1175,6 +1175,22 @@
       "cmd-ctrl-shift-y": "git::UnstageAll",
       "cmd-alt-z": "git::RestoreAndNext",
       "cmd-alt-j": "git::ToggleMergeRequestDescription",
+    },
+  },
+  {
+    // Stepping through the review comments; with vim on this takes `n` from
+    // the search-match motion while a diff is being reviewed.
+    "context": "GitDiff > Editor && !vim_mode",
+    "bindings": {
+      "n": "git::NextReviewComment",
+      "shift-n": "git::PreviousReviewComment",
+    },
+  },
+  {
+    "context": "GitDiff > Editor && VimControl && !menu",
+    "bindings": {
+      "n": "git::NextReviewComment",
+      "shift-n": "git::PreviousReviewComment",
     },
   },
   {

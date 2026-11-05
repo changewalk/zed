@@ -134,13 +134,29 @@ pub fn merge_request_from_file(file: &Path) -> Result<MergeRequest> {
 /// that did not.
 pub struct PostOutcome {
     pub merge_request: MergeRequest,
-    pub posted: Vec<(usize, String)>,
+    pub posted: Vec<PostedComment>,
     pub error: Option<anyhow::Error>,
+}
+
+/// A comment that reached the merge request: the editor's id for it, the
+/// thread it opened, and the note it became, which editing needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PostedComment {
+    pub comment_id: usize,
+    pub discussion_id: String,
+    pub note_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct PostedDiscussion {
     id: String,
+    #[serde(default)]
+    notes: Vec<PostedNote>,
+}
+
+#[derive(Deserialize)]
+struct PostedNote {
+    id: u64,
 }
 
 /// How many comments post at once. GitLab copes with a few in flight, and
@@ -165,23 +181,26 @@ pub async fn post_review(
         "projects/:id/merge_requests/{}/discussions",
         merge_request.iid
     );
-    let results: Vec<(usize, Result<String>)> = stream::iter(comments)
+    let results: Vec<Result<PostedComment>> = stream::iter(comments)
         .map(|comment| {
             let body = discussion_body(&comment, &diff_refs).to_string();
             let work_dir = work_dir.clone();
             let endpoint = endpoint.clone();
             async move {
-                let result = glab_api(&work_dir, "POST", &endpoint, Some(&body))
+                glab_api(&work_dir, "POST", &endpoint, Some(&body))
                     .await
                     .and_then(|reply| {
                         let discussion: PostedDiscussion = serde_json::from_str(&reply)
                             .context("the discussion reply is not the expected JSON")?;
-                        Ok(discussion.id)
+                        Ok(PostedComment {
+                            comment_id: comment.id,
+                            discussion_id: discussion.id,
+                            note_id: discussion.notes.first().map(|note| note.id),
+                        })
                     })
                     .with_context(|| {
                         format!("posting the comment on {}:{}", comment.path, comment.line)
-                    });
-                (comment.id, result)
+                    })
             }
         })
         .buffer_unordered(CONCURRENT_POSTS)
@@ -190,9 +209,9 @@ pub async fn post_review(
 
     let mut posted = Vec::new();
     let mut error = None;
-    for (id, result) in results {
+    for result in results {
         match result {
-            Ok(discussion_id) => posted.push((id, discussion_id)),
+            Ok(comment) => posted.push(comment),
             Err(err) => {
                 error.get_or_insert(err);
             }
@@ -228,8 +247,25 @@ pub struct RemoteDiscussion {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteNote {
+    /// GitLab's id for the note, needed to edit it.
+    pub id: Option<u64>,
     pub author: String,
     pub body: String,
+}
+
+/// Replaces the text of the note `note_id` on thread `discussion_id`.
+pub async fn update_note(
+    work_dir: PathBuf,
+    iid: u64,
+    discussion_id: String,
+    note_id: u64,
+    body: String,
+) -> Result<()> {
+    let endpoint =
+        format!("projects/:id/merge_requests/{iid}/discussions/{discussion_id}/notes/{note_id}");
+    let request = json!({ "body": body }).to_string();
+    glab_api(&work_dir, "PUT", &endpoint, Some(&request)).await?;
+    Ok(())
 }
 
 /// Adds `body` as a reply on the thread `discussion_id` and returns the
@@ -243,6 +279,8 @@ pub async fn reply_to_discussion(
     #[derive(Deserialize)]
     struct CreatedNote {
         #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
         body: String,
         #[serde(default)]
         author: Option<Author>,
@@ -253,6 +291,7 @@ pub async fn reply_to_discussion(
     let note: CreatedNote =
         serde_json::from_str(&reply).context("the reply note is not the expected JSON")?;
     Ok(RemoteNote {
+        id: note.id,
         author: note.author.map(|author| author.name).unwrap_or_default(),
         body: note.body,
     })
@@ -433,6 +472,8 @@ fn parse_discussions(text: &str) -> Result<Vec<RemoteDiscussion>> {
     #[derive(Deserialize)]
     struct RawNote {
         #[serde(default)]
+        id: Option<u64>,
+        #[serde(default)]
         body: String,
         #[serde(default)]
         system: bool,
@@ -522,6 +563,7 @@ fn parse_discussions(text: &str) -> Result<Vec<RemoteDiscussion>> {
                 notes: notes
                     .into_iter()
                     .map(|note| RemoteNote {
+                        id: note.id,
                         author: note
                             .author
                             .as_ref()
@@ -741,7 +783,7 @@ mod tests {
     fn discussions_parse_to_threads_on_both_sides_without_system_notes() {
         let text = r#"[
           {"id": "d1", "notes": [
-            {"body": "Why?", "author": {"name": "Ada"}, "created_at": "2026-10-19T10:00:00.000Z",
+            {"id": 7, "body": "Why?", "author": {"name": "Ada"}, "created_at": "2026-10-19T10:00:00.000Z",
               "position": {"new_path": "src/a.rs", "old_path": "src/a.rs", "new_line": 12, "head_sha": "abc",
               "line_range": {"start": {"new_line": 10}, "end": {"new_line": 12}}}},
             {"body": "changed status", "system": true, "author": {"name": "GitLab"}},
@@ -771,10 +813,12 @@ mod tests {
                     created_at: Some("2026-10-19T10:00:00.000Z".into()),
                     notes: vec![
                         RemoteNote {
+                            id: Some(7),
                             author: "Ada".into(),
                             body: "Why?".into(),
                         },
                         RemoteNote {
+                            id: None,
                             author: "Bob".into(),
                             body: "Because.".into(),
                         },
@@ -790,6 +834,7 @@ mod tests {
                     head_sha: None,
                     created_at: None,
                     notes: vec![RemoteNote {
+                        id: None,
                         author: "Ada".into(),
                         body: "Done".into(),
                     }],
@@ -804,6 +849,7 @@ mod tests {
                     head_sha: None,
                     created_at: None,
                     notes: vec![RemoteNote {
+                        id: None,
                         author: "Ada".into(),
                         body: "Removed".into(),
                     }],

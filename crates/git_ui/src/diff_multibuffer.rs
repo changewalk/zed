@@ -8,9 +8,10 @@ use crate::{
     },
     review_cache::{self, LastReview},
     review_order::{
-        MAX_EXCERPT_BYTES_PER_FILE, ReviewNotes, ReviewOrder, ReviewOrderFile, SummaryComment,
-        ThreadNote, build_notes_prompt, build_order_prompt, build_reply_prompt,
-        build_summary_prompt, order_from_description, parse_review_notes, parse_review_order,
+        MAX_EXCERPT_BYTES_PER_FILE, NotesStreamParser, ReviewNotes, ReviewOrder, ReviewOrderFile,
+        SummaryComment, ThreadNote, build_notes_prompt, build_order_prompt, build_reply_prompt,
+        build_summary_prompt, link_file_references, order_from_description, parse_review_file_url,
+        parse_review_order,
     },
 };
 use agent_settings::AgentSettings;
@@ -94,6 +95,9 @@ pub struct DiffMultibuffer {
     _merge_request_task: Option<Task<()>>,
     _merge_request_details_task: Option<Task<()>>,
     _review_threads_task: Option<Task<()>>,
+    /// The threads, asked for as soon as the merge request is known so they
+    /// are ready by the time the files are.
+    prefetched_discussions: Option<Task<Result<Vec<RemoteDiscussion>>>>,
     /// Re-runs the thread sync a while after the last one finished.
     _thread_refresh_task: Option<Task<()>>,
     /// A reply, resolve, or draft in flight; one at a time is plenty.
@@ -189,6 +193,21 @@ struct ReviewSummary {
     posting: bool,
 }
 
+/// One review comment as the overview lists it.
+#[derive(Clone, Debug)]
+pub(crate) struct ReviewCommentEntry {
+    pub id: usize,
+    pub author: SharedString,
+    pub path: String,
+    /// One-based line in the file.
+    pub line: u32,
+    pub snippet: String,
+    pub resolved: bool,
+    pub posted: bool,
+    pub replies: usize,
+    anchor: multi_buffer::Anchor,
+}
+
 /// How a review is finished.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ReviewVerdict {
@@ -261,6 +280,17 @@ impl DiffMultibuffer {
                 EditorEvent::ReviewReplyDraftRequested { comment_id, .. } => {
                     this.draft_review_reply(*comment_id, window, cx)
                 }
+                EditorEvent::ReviewCommentEdited {
+                    discussion_id,
+                    note_id,
+                    body,
+                } => this.update_remote_comment(
+                    discussion_id.clone(),
+                    *note_id,
+                    body.clone(),
+                    window,
+                    cx,
+                ),
                 _ => {}
             },
         );
@@ -340,6 +370,7 @@ impl DiffMultibuffer {
             _merge_request_task: None,
             _merge_request_details_task: None,
             _review_threads_task: None,
+            prefetched_discussions: None,
             _thread_refresh_task: None,
             _review_action_task: None,
             review_summary: None,
@@ -365,8 +396,8 @@ impl DiffMultibuffer {
     /// reviewers' comments too. A branch with no merge request logs and
     /// shows nothing.
     fn load_threads_when_settled(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        const MAX_POLLS: usize = 120;
+        const POLL_INTERVAL: std::time::Duration = DiffMultibuffer::SETTLE_POLL;
+        const MAX_POLLS: usize = 600;
 
         self._review_threads_task = Some(cx.spawn_in(window, async move |this, cx| {
             let mut settled_count = None;
@@ -396,6 +427,9 @@ impl DiffMultibuffer {
         *settled_count = loaded.then_some(count);
         settled
     }
+
+    /// How often the loaders are asked whether the files have settled.
+    const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
         self.branch_diff.read(cx).diff_base()
@@ -574,6 +608,38 @@ impl DiffMultibuffer {
         self.set_review_order(None, window, cx);
     }
 
+    /// Forgets everything about the merge request being reviewed, for when
+    /// the same diff view is reused for another branch: the header and its
+    /// approvals, the order and notes, the comments and threads, and the
+    /// summary box.
+    pub(crate) fn reset_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._merge_request_task.take();
+        self._merge_request_details_task.take();
+        self._review_threads_task.take();
+        self._thread_refresh_task.take();
+        self._review_action_task.take();
+        self._review_order_wait_task.take();
+        self._review_notes_task.take();
+        self.merge_request = None;
+        self.review_summary = None;
+        self.pending_notes = None;
+        self.held_review_comments.clear();
+        self.posting_review = false;
+        self.finishing_review = false;
+        self.editor
+            .read(cx)
+            .rhs_editor()
+            .clone()
+            .update(cx, |editor, cx| {
+                editor.take_review_comment_records(cx);
+            });
+        self.set_review_order(None, window, cx);
+        self.held_review_comments.clear();
+        // The new branch's threads come in once its files have loaded.
+        self.load_threads_when_settled(window, cx);
+        cx.notify();
+    }
+
     /// Shows the open merge request for the current branch above the diff.
     /// Reads it from `file` when the launcher already fetched it, else asks
     /// GitLab. No merge request is not an error.
@@ -664,6 +730,7 @@ impl DiffMultibuffer {
                     last_review,
                 });
                 this.load_merge_request_details(cx);
+                this.prefetch_discussions(cx);
                 cx.notify();
             })
             .ok();
@@ -703,6 +770,15 @@ impl DiffMultibuffer {
             })
             .ok();
         }));
+    }
+
+    /// Starts fetching the threads now; placing them waits for the files.
+    fn prefetch_discussions(&mut self, cx: &mut Context<Self>) {
+        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+            return;
+        };
+        self.prefetched_discussions =
+            Some(cx.background_spawn(gitlab_review::fetch_discussions(work_dir, iid)));
     }
 
     fn work_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
@@ -764,14 +840,13 @@ impl DiffMultibuffer {
     /// Whether the merge request and its details have been looked up, or
     /// there is nothing to look up. The prompts wait for this so the notes
     /// can draw on the description.
+    /// Whether the merge request itself has been read, which the prompts
+    /// wait for since its description shapes them. Its details, the linked
+    /// issues and approvals, are not waited for.
     fn merge_request_settled(&self) -> bool {
         self._merge_request_task
             .as_ref()
             .is_none_or(|task| task.is_ready())
-            && self
-                ._merge_request_details_task
-                .as_ref()
-                .is_none_or(|task| task.is_ready())
     }
 
     pub(crate) fn has_merge_request(&self) -> bool {
@@ -1367,6 +1442,40 @@ impl DiffMultibuffer {
         }));
     }
 
+    /// Puts the edited text of one of the user's posted comments on its
+    /// GitLab note. The editor already shows the new text; a failure says
+    /// the remote still has the old one.
+    fn update_remote_comment(
+        &mut self,
+        discussion_id: String,
+        note_id: u64,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((work_dir, iid)) = self.work_dir(cx).zip(self.merge_request_iid()) else {
+            return;
+        };
+        let request = cx.background_spawn(gitlab_review::update_note(
+            work_dir,
+            iid,
+            discussion_id,
+            note_id,
+            body,
+        ));
+        self._review_action_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Err(error) = request.await {
+                this.update(cx, |this, cx| {
+                    this.show_workspace_error(
+                        format!("The comment changed here but not on GitLab: {error:#}"),
+                        cx,
+                    )
+                })
+                .ok();
+            }
+        }));
+    }
+
     /// Resolves or reopens the thread on GitLab, then shows it so.
     fn resolve_review_thread(
         &mut self,
@@ -1504,8 +1613,8 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        const MAX_POLLS: usize = 60;
+        const POLL_INTERVAL: std::time::Duration = DiffMultibuffer::SETTLE_POLL;
+        const MAX_POLLS: usize = 300;
 
         if self.review_order.is_some()
             || matches!(
@@ -1536,12 +1645,25 @@ impl DiffMultibuffer {
             .ok();
             // The files arrive in batches, so a request sent at the first one
             // would order a fraction of the diff. Wait until loading has
-            // finished and the file count has held still for one poll.
+            // finished and the file count has held still. An order cached
+            // for this commit is used the moment the files settle, with no
+            // wait for a model.
             let mut settled_count = None;
+            let mut settled_polls = 0;
             for _ in 0..MAX_POLLS {
-                let ready = this.update(cx, |this, cx| {
-                    this.files_settled(&mut settled_count, cx)
-                        && this.merge_request_settled()
+                let ready = this.update_in(cx, |this, window, cx| {
+                    if this.files_settled(&mut settled_count, cx) {
+                        settled_polls += 1;
+                    } else {
+                        settled_polls = 0;
+                    }
+                    if settled_polls < 3 {
+                        return false;
+                    }
+                    if this.apply_cached_review_order(window, cx) {
+                        return true;
+                    }
+                    this.merge_request_settled()
                         && LanguageModelRegistry::read_global(cx)
                             .commit_message_model(cx)
                             .is_some()
@@ -1551,6 +1673,12 @@ impl DiffMultibuffer {
                     Ok(false) => cx.background_executor().timer(POLL_INTERVAL).await,
                     Err(_) => return,
                 }
+            }
+            if this
+                .read_with(cx, |this, _| this.review_order.is_some())
+                .unwrap_or(true)
+            {
+                return;
             }
             // If still not ready, this reports why through the usual error path.
             this.update_in(cx, |this, window, cx| {
@@ -1602,14 +1730,10 @@ impl DiffMultibuffer {
         }
         // The same commit against the same base is the same diff, so an
         // order written for it before is as good as a new one, and instant.
-        let cache_key = self.review_cache_key(cx);
-        if let Some(order) = cache_key
-            .as_deref()
-            .and_then(|key| review_cache::load_order(key).log_err().flatten())
-        {
-            self.set_review_order(Some(Arc::new(order)), window, cx);
+        if self.apply_cached_review_order(window, cx) {
             return;
         }
+        let cache_key = self.review_cache_key(cx);
         let known_paths: Vec<RepoPath> = files.iter().map(|file| file.path.clone()).collect();
         let context = self.merge_request_context();
         // The author's own reading order, when the description gives one,
@@ -1649,12 +1773,32 @@ impl DiffMultibuffer {
             }
         }));
         self._review_notes_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = complete_text(notes_provider, notes_model, notes_request, cx)
-                .await
-                .and_then(|text| parse_review_notes(&text, &known_paths));
+            // Each file's notes go up as soon as the model has written them,
+            // so the first files of the order are annotated while the rest
+            // are still on their way.
+            let mut parser = NotesStreamParser::default();
+            let result = stream_text(
+                notes_provider,
+                notes_model,
+                notes_request,
+                cx,
+                |chunk, cx| {
+                    for (path, notes) in parser.push(chunk, &known_paths) {
+                        this.update(cx, |this, cx| this.apply_file_notes(path, notes, cx))
+                            .ok();
+                    }
+                },
+            )
+            .await;
+            let result = result.and_then(|_| {
+                if parser.files_seen() == 0 {
+                    Err(anyhow::anyhow!("the reply names no file from this diff"))
+                } else {
+                    Ok(())
+                }
+            });
             this.update(cx, |this, cx| match result {
-                Ok(notes) => {
-                    this.apply_review_notes(notes, cx);
+                Ok(()) => {
                     if let Some((key, order)) = cache_key.as_deref().zip(this.review_order.clone())
                     {
                         review_cache::store_order(key, &order).log_err();
@@ -1672,6 +1816,42 @@ impl DiffMultibuffer {
         }));
     }
 
+    /// Puts one file's notes on the current order, or keeps them for the
+    /// order that is still on its way.
+    fn apply_file_notes(
+        &mut self,
+        path: RepoPath,
+        notes: Vec<crate::review_order::ReviewNote>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.review_order.clone() {
+            Some(order) => {
+                self.review_order = Some(Arc::new(order.with_file_notes(&path, notes)));
+                self.update_review_order_blocks(cx);
+                cx.notify();
+            }
+            None if self.review_order_state == ReviewOrderState::Suggesting => {
+                self.pending_notes
+                    .get_or_insert_with(Default::default)
+                    .insert(path, notes);
+            }
+            None => {}
+        }
+    }
+
+    /// Sets the order cached for this commit, if there is one.
+    fn apply_cached_review_order(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(order) = self
+            .review_cache_key(cx)
+            .and_then(|key| review_cache::load_order(&key).log_err().flatten())
+        else {
+            return false;
+        };
+        self.review_order_state = ReviewOrderState::Idle;
+        self.set_review_order(Some(Arc::new(order)), window, cx);
+        true
+    }
+
     /// Where the order for this diff is cached: by repository, base, and
     /// commit. None when the tip is unknown.
     fn review_cache_key(&self, cx: &App) -> Option<String> {
@@ -1681,22 +1861,6 @@ impl DiffMultibuffer {
         let work_dir = self.work_dir(cx)?;
         let head_sha = self.head_sha(cx)?;
         Some(review_cache::order_key(&work_dir, &base_ref, &head_sha))
-    }
-
-    /// Puts `notes` on the current order, or keeps them for the order that
-    /// is still on its way.
-    fn apply_review_notes(&mut self, notes: ReviewNotes, cx: &mut Context<Self>) {
-        match self.review_order.clone() {
-            Some(order) => {
-                self.review_order = Some(Arc::new(order.with_notes(notes)));
-                self.update_review_order_blocks(cx);
-                cx.notify();
-            }
-            None if self.review_order_state == ReviewOrderState::Suggesting => {
-                self.pending_notes = Some(notes);
-            }
-            None => {}
-        }
     }
 
     fn fail_review_order(&mut self, message: SharedString, cx: &mut Context<Self>) {
@@ -1779,10 +1943,11 @@ impl DiffMultibuffer {
                             .rhs_editor()
                             .clone()
                             .update(cx, |editor, cx| {
-                                for (id, discussion_id) in &outcome.posted {
+                                for posted in &outcome.posted {
                                     editor.mark_review_comment_posted(
-                                        *id,
-                                        discussion_id.clone(),
+                                        posted.comment_id,
+                                        posted.discussion_id.clone(),
+                                        posted.note_id,
                                         window,
                                         cx,
                                     );
@@ -1832,17 +1997,20 @@ impl DiffMultibuffer {
             return;
         };
         let iid = self.merge_request.as_ref().map(|header| header.iid);
-        let fetch = cx.background_spawn(async move {
-            let iid = match iid {
-                Some(iid) => iid,
-                None => {
-                    gitlab_review::merge_request_for_branch(work_dir.clone(), branch)
-                        .await?
-                        .iid
-                }
-            };
-            gitlab_review::fetch_discussions(work_dir, iid).await
-        });
+        let fetch = match self.prefetched_discussions.take() {
+            Some(prefetched) => prefetched,
+            None => cx.background_spawn(async move {
+                let iid = match iid {
+                    Some(iid) => iid,
+                    None => {
+                        gitlab_review::merge_request_for_branch(work_dir.clone(), branch)
+                            .await?
+                            .iid
+                    }
+                };
+                gitlab_review::fetch_discussions(work_dir, iid).await
+            }),
+        };
         self._review_threads_task = Some(cx.spawn_in(window, async move |this, cx| {
             match fetch.await {
                 Ok(discussions) => {
@@ -1996,6 +2164,7 @@ impl DiffMultibuffer {
                 if known.contains(&discussion.id) {
                     editor.set_review_thread_state(
                         &discussion.id,
+                        first.id,
                         replies,
                         discussion.resolved,
                         since_last_review,
@@ -2044,6 +2213,7 @@ impl DiffMultibuffer {
                     Some(first.author.clone().into()),
                     Some(ReviewThread {
                         discussion_id: discussion.id.clone(),
+                        note_id: first.id,
                         replies,
                         resolved: discussion.resolved,
                         original_line,
@@ -2184,64 +2354,60 @@ impl DiffMultibuffer {
         files
     }
 
-    /// Puts a one-line header with the file's place and reason above the first
-    /// excerpt of each file the review order lists, and each of the file's
-    /// guiding notes above the line it describes.
+    /// Goes to the file, and line, that a link in a note points at.
+    fn open_review_reference(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, line)) = parse_review_file_url(url) else {
+            return;
+        };
+        let Some(subscription) = self.buffer_subscriptions.get(&path) else {
+            return;
+        };
+        let buffer = subscription.display_buffer.read(cx).snapshot();
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let row = line
+            .map(|line| line.saturating_sub(1))
+            .unwrap_or(0)
+            .min(buffer.max_point().row);
+        // A line the diff does not show is reached through the nearest one
+        // it does.
+        let row = nearest_shown_row(&snapshot, &buffer, row).unwrap_or(row);
+        let Some(anchor) = snapshot.anchor_in_excerpt(buffer.anchor_before(Point::new(row, 0)))
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([anchor..anchor]),
+                );
+                let focus_handle = editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+            })
+        });
+    }
+
+    /// A note or reason as markdown that can be selected, copied, and whose
+    /// file mentions can be clicked.
+    fn review_note_markdown(&self, text: &str, cx: &mut Context<Self>) -> Entity<Markdown> {
+        let known: Vec<RepoPath> = self.buffer_subscriptions.keys().cloned().collect();
+        let source: SharedString = link_file_references(text, &known).into();
+        cx.new(|cx| Markdown::new(source, None, None, cx))
+    }
+
+    /// Puts a band above the first excerpt of each file the review order
+    /// lists, with the file's reason, and one above each line a guiding
+    /// note describes.
     fn update_review_order_blocks(&mut self, cx: &mut Context<Self>) {
         let old_blocks: HashSet<CustomBlockId> = self.review_order_blocks.drain(..).collect();
-        let mut blocks = Vec::new();
+        let mut bands = Vec::new();
         if let Some(order) = self.review_order.clone()
             && let Some(repo) = self.branch_diff.read(cx).repo().cloned()
         {
-            let total = order.len();
             let snapshot = self.multibuffer.read(cx).snapshot(cx);
-            for (index, entry) in order.entries().iter().enumerate() {
-                if let Some(subscription) = self.buffer_subscriptions.get(&entry.path) {
-                    let buffer = subscription.display_buffer.read(cx).snapshot();
-                    for note in &entry.notes {
-                        // A note past the end of the file lands on its last line.
-                        let row = note.line.saturating_sub(1).min(buffer.max_point().row);
-                        let text_anchor = buffer.anchor_before(Point::new(row, 0));
-                        let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
-                            continue;
-                        };
-                        let text = note.text.clone();
-                        blocks.push(BlockProperties {
-                            placement: BlockPlacement::Above(anchor),
-                            height: Some(1),
-                            style: BlockStyle::Flex,
-                            render: Arc::new(move |cx| {
-                                // A tinted band with an accent edge, so the
-                                // note reads apart from the code around it.
-                                let colors = cx.theme().colors();
-                                h_flex()
-                                    .id(cx.block_id)
-                                    .h(cx.line_height)
-                                    .w_full()
-                                    .pl(cx.margins.gutter.width)
-                                    .pr_2()
-                                    .gap_2()
-                                    .overflow_hidden()
-                                    .border_l_2()
-                                    .border_color(colors.text_accent)
-                                    .bg(colors.text_accent.opacity(0.12))
-                                    .child(
-                                        Icon::new(IconName::Sparkle)
-                                            .size(IconSize::Small)
-                                            .color(Color::Accent),
-                                    )
-                                    .child(
-                                        Label::new(text.clone())
-                                            .size(LabelSize::Default)
-                                            .color(Color::Default)
-                                            .italic(),
-                                    )
-                                    .into_any_element()
-                            }),
-                            priority: 0,
-                        });
-                    }
-                }
+            for entry in order.entries() {
                 let status = self
                     .branch_diff
                     .read(cx)
@@ -2249,16 +2415,62 @@ impl DiffMultibuffer {
                     .unwrap_or(FileStatus::Untracked);
                 let path_key =
                     project_diff_path_key(repo.read(cx), &entry.path, status, Some(&*order), cx);
-                let Some(anchor) = self.multibuffer.read(cx).location_for_path(&path_key, cx)
-                else {
+                if let Some(anchor) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+                    let reason = self.review_note_markdown(&entry.reason, cx);
+                    bands.push((anchor, BlockStyle::Sticky, reason));
+                }
+                let Some(subscription) = self.buffer_subscriptions.get(&entry.path) else {
                     continue;
                 };
-                let reason = entry.reason.clone();
-                blocks.push(BlockProperties {
+                let buffer = subscription.display_buffer.read(cx).snapshot();
+                let mut notes: Vec<_> = entry.notes.iter().collect();
+                notes.sort_by_key(|note| note.line);
+                for note in notes {
+                    // A note past the end of the file lands on its last line.
+                    let row = note.line.saturating_sub(1).min(buffer.max_point().row);
+                    let text_anchor = buffer.anchor_before(Point::new(row, 0));
+                    let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
+                        continue;
+                    };
+                    let markdown = self.review_note_markdown(&note.text, cx);
+                    bands.push((anchor, BlockStyle::Flex, markdown));
+                }
+            }
+        }
+        // Two bands with no code between them read as one long note, so a
+        // note that would sit right under another band is left out. A
+        // file's band wins over a note at the end of the file before it.
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let mut kept: Vec<(multi_buffer::Anchor, BlockStyle, Entity<Markdown>)> = Vec::new();
+        for band in bands {
+            let row = band.0.to_point(&snapshot).row;
+            let adjacent = kept
+                .last()
+                .is_some_and(|last| row <= last.0.to_point(&snapshot).row + 1);
+            if adjacent {
+                if band.1 == BlockStyle::Sticky
+                    && kept.last().is_some_and(|last| last.1 != BlockStyle::Sticky)
+                {
+                    kept.pop();
+                } else {
+                    continue;
+                }
+            }
+            kept.push(band);
+        }
+        let this = cx.weak_entity();
+        let blocks: Vec<BlockProperties<multi_buffer::Anchor>> = kept
+            .into_iter()
+            .map(|(anchor, style, markdown)| {
+                let this = this.clone();
+                BlockProperties {
                     placement: BlockPlacement::Above(anchor),
                     height: Some(1),
-                    style: BlockStyle::Sticky,
+                    style,
                     render: Arc::new(move |cx| {
+                        // A tinted band with an accent edge, so it reads
+                        // apart from the code around it.
+                        let colors = cx.theme().colors();
                         h_flex()
                             .id(cx.block_id)
                             .h(cx.line_height)
@@ -2266,26 +2478,22 @@ impl DiffMultibuffer {
                             .pl(cx.margins.gutter.width)
                             .pr_2()
                             .gap_2()
+                            .overflow_hidden()
                             .border_l_2()
-                            .border_color(cx.theme().colors().text_accent)
-                            .bg(cx.theme().colors().text_accent.opacity(0.12))
+                            .border_color(colors.text_accent)
+                            .bg(colors.text_accent.opacity(0.12))
                             .child(
-                                Label::new(format!("{} of {}", index + 1, total))
-                                    .size(LabelSize::Default)
-                                    .weight(FontWeight::SEMIBOLD)
+                                Icon::new(IconName::Sparkle)
+                                    .size(IconSize::Small)
                                     .color(Color::Accent),
                             )
-                            .child(
-                                Label::new(reason.clone())
-                                    .size(LabelSize::Default)
-                                    .color(Color::Default),
-                            )
+                            .child(render_review_note(markdown.clone(), this.clone(), cx))
                             .into_any_element()
                     }),
                     priority: 0,
-                });
-            }
-        }
+                }
+            })
+            .collect();
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
                 if !old_blocks.is_empty() {
@@ -2296,6 +2504,143 @@ impl DiffMultibuffer {
                 }
             })
         });
+    }
+
+    /// The review comments in the buffer, top to bottom, with what an
+    /// overview needs to show and jump to each.
+    pub(crate) fn review_comment_entries(&self, cx: &App) -> Vec<ReviewCommentEntry> {
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let mut entries: Vec<(u32, ReviewCommentEntry)> = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .review_comments()
+            .into_iter()
+            .map(|comment| {
+                let start = comment.range.start.to_point(&snapshot);
+                let line = snapshot
+                    .point_to_buffer_point(start)
+                    .map_or(start.row, |(_, point)| point.row)
+                    + 1;
+                let first_line = comment.text.lines().next().unwrap_or_default().trim();
+                let snippet: String = first_line.chars().take(70).collect();
+                let snippet = if first_line.chars().count() > 70 {
+                    format!("{snippet}…")
+                } else {
+                    snippet
+                };
+                (
+                    start.row,
+                    ReviewCommentEntry {
+                        id: comment.id,
+                        author: comment.author.clone().unwrap_or_else(|| "You".into()),
+                        path: comment.file_path.as_unix_str().to_string(),
+                        line,
+                        snippet,
+                        resolved: comment
+                            .thread
+                            .as_ref()
+                            .is_some_and(|thread| thread.resolved),
+                        posted: comment.thread.is_some(),
+                        replies: comment
+                            .thread
+                            .as_ref()
+                            .map_or(0, |thread| thread.replies.len()),
+                        anchor: comment.range.start,
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by_key(|(row, entry)| (*row, entry.id));
+        entries.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    /// Which comment the cursor is at or below, one-based, with how many
+    /// there are; the position is None while the cursor is above the first.
+    pub(crate) fn review_comment_position(&self, cx: &App) -> Option<(Option<usize>, usize)> {
+        let entries = self.review_comment_entries(cx);
+        if entries.is_empty() {
+            return None;
+        }
+        let snapshot = self.multibuffer.read(cx).snapshot(cx);
+        let cursor = self
+            .editor
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .selections
+            .newest_anchor()
+            .head()
+            .to_point(&snapshot)
+            .row;
+        let at_or_above = entries
+            .iter()
+            .filter(|entry| entry.anchor.to_point(&snapshot).row <= cursor)
+            .count();
+        Some(((at_or_above > 0).then_some(at_or_above), entries.len()))
+    }
+
+    /// Moves the cursor to the next comment, or the previous one, wrapping
+    /// round at either end.
+    pub(crate) fn go_to_review_comment(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.review_comment_entries(cx);
+        let Some((position, total)) = self.review_comment_position(cx) else {
+            return;
+        };
+        let index = match (position, forward) {
+            (None, true) => 0,
+            (None, false) => total - 1,
+            (Some(at), true) => at % total,
+            (Some(at), false) => (at + total - 2) % total,
+        };
+        let Some(entry) = entries.get(index) else {
+            return;
+        };
+        self.jump_to_review_comment(entry.anchor, window, cx);
+    }
+
+    /// Moves the cursor to the comment with `id`.
+    pub(crate) fn go_to_review_comment_id(
+        &mut self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .review_comment_entries(cx)
+            .into_iter()
+            .find(|entry| entry.id == id)
+        else {
+            return;
+        };
+        self.jump_to_review_comment(entry.anchor, window, cx);
+    }
+
+    fn jump_to_review_comment(
+        &mut self,
+        anchor: multi_buffer::Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([anchor..anchor]),
+                );
+                let focus_handle = editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+            })
+        });
+        cx.notify();
     }
 
     /// Returns a reference to the splittable editor.
@@ -3036,6 +3381,33 @@ fn new_row_for_old_row(
         .unwrap_or(0)
 }
 
+/// A note's text as a markdown element: selectable, with file mentions as
+/// links that move the diff to the file.
+fn render_review_note(
+    markdown: Entity<Markdown>,
+    diff: WeakEntity<DiffMultibuffer>,
+    cx: &mut editor::display_map::BlockContext,
+) -> AnyElement {
+    let mut style = editor::hover_markdown_style(cx.window, cx.app);
+    style.link.color = Some(cx.theme().colors().text_accent);
+    style.link.underline = Some(gpui::UnderlineStyle {
+        thickness: px(1.),
+        color: Some(cx.theme().colors().text_accent),
+        wavy: false,
+    });
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .child(
+            MarkdownElement::new(markdown, style).on_url_click(move |url, window, cx| {
+                diff.update(cx, |diff, cx| diff.open_review_reference(&url, window, cx))
+                    .ok();
+            }),
+        )
+        .into_any_element()
+}
+
 /// Seconds since the Unix epoch for one of GitLab's ISO 8601 timestamps.
 fn parse_timestamp(text: &str) -> Option<i64> {
     time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
@@ -3082,6 +3454,31 @@ fn text_request(prompt: String, model: &LanguageModel, cx: &App) -> LanguageMode
         compact_at_tokens: None,
         max_output_tokens: None,
     }
+}
+
+/// Sends `request` to `model` and hands each chunk of the reply to
+/// `on_chunk` as it arrives.
+async fn stream_text(
+    provider: Arc<dyn LanguageModelProvider>,
+    model: LanguageModel,
+    request: LanguageModelRequest,
+    cx: &mut AsyncWindowContext,
+    mut on_chunk: impl FnMut(&str, &mut AsyncWindowContext),
+) -> Result<()> {
+    if let Some(task) =
+        cx.update(|_, cx| (!provider.is_authenticated(cx)).then(|| provider.authenticate(cx)))?
+    {
+        task.await.log_err();
+    }
+    let mut stream = provider
+        .stream_completion_text(&model, request, cx)
+        .await
+        .context("the model request failed")?;
+    while let Some(chunk) = stream.stream.next().await {
+        let chunk = chunk.context("the model reply stopped early")?;
+        on_chunk(&chunk, cx);
+    }
+    Ok(())
 }
 
 /// Sends `request` to `model` and collects the whole reply as text.

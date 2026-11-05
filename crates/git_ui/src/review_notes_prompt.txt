@@ -8,6 +8,7 @@ Rules for the notes:
 - When the merge request's description or a linked issue explains why a part is there, say so in the note, so the reader knows the intent and not only the mechanics.
 - One sentence, at most twenty words.
 - "line" is a line number shown on a "+" line of that file. Put the note on the first line of the part it describes.
+- Leave at least a few lines between notes, and none on the first changed line of a file: the file's own summary already sits there, and two notes together read as one.
 
 Reply with a JSON array only, no prose before or after it. Each element has two fields: "path", copied exactly from the list, and "notes", an array of objects with "line" and "note". Leave out files with no notes.
 
