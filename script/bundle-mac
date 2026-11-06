@@ -105,6 +105,13 @@ script/generate-licenses
 
 rustup target add $target_triple
 
+# Without full Xcode there is no `metal` compiler, so compile shaders at launch instead.
+if ! xcrun -sdk macosx --find metal >/dev/null 2>&1; then
+    echo "metal compiler not found; building with runtime shader compilation"
+    zed_features="${zed_features} --features gpui_platform/runtime_shaders"
+    remote_server_features="${remote_server_features} --features gpui_platform/runtime_shaders"
+fi
+
 echo "Compiling zed binaries"
 if [[ "$target_dir" = "release" ]]; then
     cargo --config .cargo/bundle-config.toml rustc ${build_flag} ${zed_features} --package zed --bin zed --target $target_triple -- -C 'link-arg=-Wl,-unexported_symbol,__R*'
@@ -249,18 +256,23 @@ function sign_app_binaries() {
     bundle_name=$(basename "$app_path")
 
     if [ "$local_install" = true ]; then
-        rm -rf "/Applications/$bundle_name"
-        mv "$app_path" "/Applications/$bundle_name"
-        echo "Installed application bundle: /Applications/$bundle_name"
+        # ZED_INSTALL_DIR lets non-admin users install into ~/Applications
+        install_dir="${ZED_INSTALL_DIR:-/Applications}"
+        mkdir -p "$install_dir"
+        rm -rf "$install_dir/$bundle_name"
+        mv "$app_path" "$install_dir/$bundle_name"
+        echo "Installed application bundle: $install_dir/$bundle_name"
         if [ "$open_result" = true ]; then
-            echo "Opening /Applications/$bundle_name"
-            open "/Applications/$bundle_name"
+            echo "Opening $install_dir/$bundle_name"
+            open "$install_dir/$bundle_name"
         fi
     elif [ "$open_result" = true ]; then
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
+    if [ "$local_install" = true ]; then
+        echo "Local install - skipping DMG creation"
+    elif [[ "$target_dir" = "debug" ]]; then
         echo "Debug build detected - skipping DMG creation and signing"
         if [ "$local_install" = false ]; then
             echo "Created application bundle:"
