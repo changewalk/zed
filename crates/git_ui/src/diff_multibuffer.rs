@@ -1362,6 +1362,26 @@ impl DiffMultibuffer {
                             ReviewVerdict::RequestChanges => "Requested changes",
                         };
                         this.review_summary.take();
+                        // Show the verdict at once; the details fetch confirms it.
+                        if let Some(header) = this.merge_request.as_mut() {
+                            match verdict {
+                                ReviewVerdict::Approve => {
+                                    if let Some(approvals) = header.approvals.as_mut() {
+                                        approvals.user_has_approved = !approved;
+                                    }
+                                }
+                                ReviewVerdict::RequestChanges => {
+                                    if let Some(reviewer) = header.reviewer.as_mut() {
+                                        reviewer.state = if changes_requested {
+                                            ReviewerState::Reviewed
+                                        } else {
+                                            ReviewerState::RequestedChanges
+                                        };
+                                    }
+                                }
+                                ReviewVerdict::Comment => {}
+                            }
+                        }
                         this.mark_reviewed(cx);
                         this.load_merge_request_details(cx);
                         this.show_review_toast(format!("{what} on !{iid}"), cx);

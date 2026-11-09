@@ -1084,11 +1084,16 @@ impl SerializableItem for BranchDiff {
 
 pub struct BranchDiffToolbar {
     branch_diff: Option<WeakEntity<BranchDiff>>,
+    /// Repaints the buttons as the diff's review state changes.
+    _diff_observation: Option<Subscription>,
 }
 
 impl BranchDiffToolbar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { branch_diff: None }
+        Self {
+            branch_diff: None,
+            _diff_observation: None,
+        }
     }
 
     fn branch_diff(&self, _: &App) -> Option<Entity<BranchDiff>> {
@@ -1118,6 +1123,10 @@ impl ToolbarItemView for BranchDiffToolbar {
         self.branch_diff = active_pane_item
             .and_then(|item| item.act_as::<BranchDiff>(cx))
             .map(|entity| entity.downgrade());
+        self._diff_observation = self.branch_diff(cx).map(|branch_diff| {
+            let diff = branch_diff.read(cx).diff.clone();
+            cx.observe(&diff, |_, _, cx| cx.notify())
+        });
         if self.branch_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {

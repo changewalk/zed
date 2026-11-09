@@ -1179,18 +1179,30 @@
   },
   {
     // Stepping through the review comments; with vim on this takes `n` from
-    // the search-match motion while a diff is being reviewed.
-    "context": "GitDiff > Editor && !vim_mode",
+    // the search-match motion while a diff is being reviewed. The comment
+    // boxes are single-line editors inside the diff, so `mode == full` keeps
+    // typing in them untouched.
+    "context": "GitDiff > Editor && mode == full && !vim_mode",
     "bindings": {
       "n": "git::NextReviewComment",
       "shift-n": "git::PreviousReviewComment",
     },
   },
   {
-    "context": "GitDiff > Editor && VimControl && !menu",
+    "context": "GitDiff > Editor && mode == full && VimControl && !menu",
     "bindings": {
       "n": "git::NextReviewComment",
       "shift-n": "git::PreviousReviewComment",
+    },
+  },
+  {
+    // The review comment, reply and edit boxes are single-line editors inside
+    // the diff. A key the box does not bind bubbles up to the diff editor, so
+    // without this `n` typed in a box would step to the next comment instead.
+    "context": "GitDiff > Editor && mode == single_line",
+    "bindings": {
+      "n": null,
+      "shift-n": null,
     },
   },
   {

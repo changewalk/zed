@@ -908,6 +908,8 @@ pub(crate) mod persistence {
 pub struct ProjectDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
     workspace: WeakEntity<Workspace>,
+    /// Repaints the buttons as the diff's review state changes.
+    _diff_observation: Option<Subscription>,
 }
 
 impl ProjectDiffToolbar {
@@ -915,6 +917,7 @@ impl ProjectDiffToolbar {
         Self {
             project_diff: None,
             workspace: workspace.weak_handle(),
+            _diff_observation: None,
         }
     }
 
@@ -970,6 +973,10 @@ impl ToolbarItemView for ProjectDiffToolbar {
         self.project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
             .map(|entity| entity.downgrade());
+        self._diff_observation = self.project_diff(cx).map(|project_diff| {
+            let diff = project_diff.read(cx).diff.clone();
+            cx.observe(&diff, |_, _, cx| cx.notify())
+        });
         if self.project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
@@ -1286,10 +1293,16 @@ pub(crate) fn render_review_buttons(
         );
     }
     if let Some((approved, busy)) = diff.approval_state() {
-        let (label, tooltip) = if approved {
-            ("Unapprove", "Withdraw your approval of the merge request")
+        let tooltip = if approved {
+            "Withdraw your approval of the merge request"
         } else {
-            ("Approve", "Approve the merge request")
+            "Approve the merge request"
+        };
+        let label = match (approved, busy) {
+            (true, true) => "Withdrawing…",
+            (true, false) => "Unapprove",
+            (false, true) => "Approving…",
+            (false, false) => "Approve",
         };
         buttons.push(
             Button::new("approve-merge-request", label)
