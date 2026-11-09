@@ -1948,6 +1948,7 @@ impl DiffMultibuffer {
         if comments.is_empty() {
             return;
         }
+        let total = comments.len();
 
         self.posting_review = true;
         cx.notify();
@@ -1976,7 +1977,7 @@ impl DiffMultibuffer {
                         match outcome.error {
                             Some(error) => this.fail_post_review(
                                 format!(
-                                    "{} of the comments posted, then: {error:#}",
+                                    "{} of {total} comments posted. {error:#}",
                                     outcome.posted.len()
                                 )
                                 .into(),

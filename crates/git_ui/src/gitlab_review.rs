@@ -9,7 +9,10 @@ use futures::{AsyncWriteExt as _, StreamExt as _, stream};
 use serde::Deserialize;
 use serde_json::json;
 use sha1::{Digest as _, Sha1};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use util::command::{Stdio, new_command};
 
 /// A review comment resolved to a path and a line in the new version of a file.
@@ -177,13 +180,34 @@ pub async fn post_review(
         .clone()
         .context("the merge request has no diff refs yet; is the branch pushed?")?;
 
+    // GitLab places a comment by its line in the merge request's own diff,
+    // between base_sha and head_sha. The view shows the file as it is on
+    // disk, which may be ahead of, behind, or edited since head_sha, so each
+    // line is mapped onto head_sha and checked against that diff first.
+    ensure_commits(&work_dir, &[&diff_refs.base_sha, &diff_refs.head_sha]).await?;
+    let mut files: HashMap<String, FileOnGitLab> = HashMap::new();
+    for comment in &comments {
+        if !files.contains_key(&comment.path) {
+            let file = FileOnGitLab::load(&work_dir, &diff_refs, &comment.path).await?;
+            files.insert(comment.path.clone(), file);
+        }
+    }
+    let mut placed = Vec::new();
+    let mut unplaced = Vec::new();
+    for comment in comments {
+        match files[&comment.path].place(&comment, &diff_refs) {
+            Ok(body) => placed.push((comment, body)),
+            Err(reason) => unplaced.push(reason),
+        }
+    }
+
     let endpoint = format!(
         "projects/:id/merge_requests/{}/discussions",
         merge_request.iid
     );
-    let results: Vec<Result<PostedComment>> = stream::iter(comments)
-        .map(|comment| {
-            let body = discussion_body(&comment, &diff_refs).to_string();
+    let results: Vec<Result<PostedComment>> = stream::iter(placed)
+        .map(|(comment, body)| {
+            let body = body.to_string();
             let work_dir = work_dir.clone();
             let endpoint = endpoint.clone();
             async move {
@@ -216,6 +240,21 @@ pub async fn post_review(
                 error.get_or_insert(err);
             }
         }
+    }
+    if !unplaced.is_empty() {
+        let unplaced = anyhow!(
+            "{} could not be placed on the merge request: {}",
+            if unplaced.len() == 1 {
+                "one comment".to_string()
+            } else {
+                format!("{} comments", unplaced.len())
+            },
+            unplaced.join("; ")
+        );
+        error = Some(match error {
+            Some(error) => anyhow!("{error:#}. Also, {unplaced}"),
+            None => unplaced,
+        });
     }
     Ok(PostOutcome {
         merge_request,
@@ -606,36 +645,257 @@ fn first_merge_request_iid(listed: &str, branch: &str) -> Result<u64> {
 
 /// The JSON body that creates one inline discussion on the new side of the
 /// diff, spanning the comment's lines when it covers more than one.
-fn discussion_body(comment: &GitLabComment, diff_refs: &DiffRefs) -> serde_json::Value {
-    let mut position = json!({
-        "position_type": "text",
-        "base_sha": diff_refs.base_sha,
-        "head_sha": diff_refs.head_sha,
-        "start_sha": diff_refs.start_sha,
-        "new_path": comment.path,
-        "old_path": comment.path,
-        "new_line": comment.line,
-    });
-    if comment.start_line < comment.line {
-        position["line_range"] = json!({
-            "start": line_range_end(&comment.path, comment.start_line),
-            "end": line_range_end(&comment.path, comment.line),
-        });
+/// Runs git in `work_dir` and returns what it printed.
+async fn git(work_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = new_command("git")
+        .args(args)
+        .current_dir(work_dir)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
-    json!({ "body": comment.body, "position": position })
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// One end of a multi-line position. GitLab wants its line code, which is the
-/// SHA-1 of the path joined to the old and new line numbers; for a line on
-/// the new side the old number is not checked, so the new one stands in.
-fn line_range_end(path: &str, new_line: u32) -> serde_json::Value {
-    let path_hash = format!("{:x}", Sha1::digest(path.as_bytes()));
-    json!({
-        "line_code": format!("{path_hash}_{new_line}_{new_line}"),
-        "type": "new",
-        "old_line": null,
-        "new_line": new_line,
+/// Fetches any of `shas` the clone does not have yet, so the merge request's
+/// diff can be read locally.
+async fn ensure_commits(work_dir: &Path, shas: &[&str]) -> Result<()> {
+    for sha in shas {
+        let commit = format!("{sha}^{{commit}}");
+        if git(work_dir, &["cat-file", "-e", &commit]).await.is_ok() {
+            continue;
+        }
+        git(work_dir, &["fetch", "--quiet", "origin", sha])
+            .await
+            .with_context(|| format!("the merge request's commit {sha} is not in this clone"))?;
+    }
+    Ok(())
+}
+
+/// A hunk header of a unified diff: the old and new line ranges it covers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hunk {
+    old_start: u32,
+    old_len: u32,
+    new_start: u32,
+    new_len: u32,
+}
+
+/// Reads `@@ -a,b +c,d @@`; a range without a count covers one line.
+fn parse_hunk_header(line: &str) -> Option<Hunk> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (ranges, _) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let range = |text: &str| -> Option<(u32, u32)> {
+        match text.split_once(',') {
+            Some((start, len)) => Some((start.parse().ok()?, len.parse().ok()?)),
+            None => Some((text.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_len) = range(old)?;
+    let (new_start, new_len) = range(new)?;
+    Some(Hunk {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
     })
+}
+
+/// A line of the merge request's diff, keyed by its number in the new file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiffLine {
+    /// The line's number in the old file when it is unchanged; an added line
+    /// has none.
+    old_line: Option<u32>,
+    /// The old side's line counter when the diff reached this line, which
+    /// GitLab's line codes carry for added lines too.
+    old_position: u32,
+}
+
+/// The lines of one file that GitLab's diff of the merge request shows.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DiffFile {
+    /// The path before a rename, when the diff names one.
+    old_path: Option<String>,
+    lines: HashMap<u32, DiffLine>,
+}
+
+/// Reads the unified diff of one file, as `git diff -U3 base head -- path`
+/// prints it, into the lines a comment may sit on.
+fn parse_diff_file(text: &str) -> DiffFile {
+    let mut file = DiffFile::default();
+    let mut in_hunk = false;
+    let (mut old, mut new) = (0u32, 0u32);
+    for line in text.lines() {
+        if let Some(hunk) = parse_hunk_header(line) {
+            in_hunk = true;
+            old = hunk.old_start;
+            new = hunk.new_start;
+            continue;
+        }
+        if !in_hunk {
+            if let Some(path) = line.strip_prefix("--- a/") {
+                file.old_path = Some(path.to_string());
+            }
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'+') => {
+                file.lines.insert(
+                    new,
+                    DiffLine {
+                        old_line: None,
+                        old_position: old,
+                    },
+                );
+                new += 1;
+            }
+            Some(b'-') => old += 1,
+            Some(b' ') => {
+                file.lines.insert(
+                    new,
+                    DiffLine {
+                        old_line: Some(old),
+                        old_position: old,
+                    },
+                );
+                old += 1;
+                new += 1;
+            }
+            // "\ No newline at end of file", or a header of the next file.
+            _ => {}
+        }
+    }
+    file
+}
+
+/// The hunks of `git diff -U0 head -- path`: what changed between the merge
+/// request's head commit and the file on disk.
+fn parse_hunks(text: &str) -> Vec<Hunk> {
+    text.lines().filter_map(parse_hunk_header).collect()
+}
+
+/// Where line `local_line` of the file on disk sits in the merge request's
+/// head commit, if the line is unchanged between the two.
+fn line_in_head(hunks: &[Hunk], local_line: u32) -> Option<u32> {
+    let mut shift: i64 = 0;
+    for hunk in hunks {
+        if hunk.new_len > 0 && (hunk.new_start..hunk.new_start + hunk.new_len).contains(&local_line)
+        {
+            return None;
+        }
+        let hunk_end = if hunk.new_len == 0 {
+            hunk.new_start
+        } else {
+            hunk.new_start + hunk.new_len - 1
+        };
+        if local_line > hunk_end {
+            shift += i64::from(hunk.old_len) - i64::from(hunk.new_len);
+        }
+    }
+    u32::try_from(i64::from(local_line) + shift).ok()
+}
+
+/// One file of the merge request as GitLab holds it, next to how the file on
+/// disk differs from it.
+struct FileOnGitLab {
+    path: String,
+    diff: DiffFile,
+    /// Changes from the merge request's head commit to the file on disk.
+    since_head: Vec<Hunk>,
+}
+
+impl FileOnGitLab {
+    async fn load(work_dir: &Path, diff_refs: &DiffRefs, path: &str) -> Result<Self> {
+        let diff = git(
+            work_dir,
+            &[
+                "diff",
+                "-U3",
+                &diff_refs.base_sha,
+                &diff_refs.head_sha,
+                "--",
+                path,
+            ],
+        )
+        .await?;
+        let since_head = git(work_dir, &["diff", "-U0", &diff_refs.head_sha, "--", path]).await?;
+        Ok(Self {
+            path: path.to_string(),
+            diff: parse_diff_file(&diff),
+            since_head: parse_hunks(&since_head),
+        })
+    }
+
+    /// The discussion to post for `comment`, or why GitLab would not take it.
+    fn place(
+        &self,
+        comment: &GitLabComment,
+        diff_refs: &DiffRefs,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let head = &diff_refs.head_sha[..diff_refs.head_sha.len().min(7)];
+        let in_head = |local_line: u32| {
+            line_in_head(&self.since_head, local_line).ok_or_else(|| {
+                format!(
+                    "{}:{local_line} is not in the merge request's head commit {head}; \
+                     the file on disk differs from what GitLab has, so update or push \
+                     the branch and place the comment again",
+                    self.path
+                )
+            })
+        };
+        let line = in_head(comment.line)?;
+        let start_line = in_head(comment.start_line.min(comment.line))?;
+        let on_diff = |new_line: u32| {
+            self.diff.lines.get(&new_line).copied().ok_or_else(|| {
+                format!(
+                    "{}:{new_line} is outside the merge request's diff on GitLab, \
+                     which only takes comments on changed lines and the three lines \
+                     around them",
+                    self.path
+                )
+            })
+        };
+        let end = on_diff(line)?;
+        let start = on_diff(start_line)?;
+
+        let path_hash = format!("{:x}", Sha1::digest(self.path.as_bytes()));
+        let range_end = |new_line: u32, diff_line: DiffLine| {
+            json!({
+                "line_code": format!("{path_hash}_{}_{new_line}", diff_line.old_position),
+                "type": if diff_line.old_line.is_some() { None } else { Some("new") },
+                "old_line": diff_line.old_line,
+                "new_line": new_line,
+            })
+        };
+        let mut position = json!({
+            "position_type": "text",
+            "base_sha": diff_refs.base_sha,
+            "head_sha": diff_refs.head_sha,
+            "start_sha": diff_refs.start_sha,
+            "new_path": self.path,
+            "old_path": self.diff.old_path.as_deref().unwrap_or(&self.path),
+            "new_line": line,
+        });
+        if let Some(old_line) = end.old_line {
+            position["old_line"] = json!(old_line);
+        }
+        if start_line < line {
+            position["line_range"] = json!({
+                "start": range_end(start_line, start),
+                "end": range_end(line, end),
+            });
+        }
+        Ok(json!({ "body": comment.body, "position": position }))
+    }
 }
 
 /// Runs `glab api` in `work_dir` and returns the response body.
@@ -709,74 +969,181 @@ async fn glab_graphql(work_dir: &Path, query: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn discussion_body_places_the_comment_on_the_new_side() {
-        let comment = GitLabComment {
-            id: 7,
-            path: "src/loop.rs".into(),
-            start_line: 41,
-            line: 41,
-            body: "Why not reuse the hunk key?".into(),
-        };
-        let diff_refs = DiffRefs {
+    const README_DIFF: &str = "\
+diff --git a/docs/README.md b/docs/README.md
+index 1111111..2222222 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -38,4 +38,6 @@ Intro
+ context one
+-gone
++fresh one
++fresh two
+ context two
+ context three
+";
+
+    fn refs() -> DiffRefs {
+        DiffRefs {
             base_sha: "b".into(),
             head_sha: "h".into(),
             start_sha: "s".into(),
-        };
+        }
+    }
 
+    fn file(since_head: &[Hunk]) -> FileOnGitLab {
+        FileOnGitLab {
+            path: "docs/README.md".into(),
+            diff: parse_diff_file(README_DIFF),
+            since_head: since_head.to_vec(),
+        }
+    }
+
+    fn comment(start_line: u32, line: u32) -> GitLabComment {
+        GitLabComment {
+            id: 7,
+            path: "docs/README.md".into(),
+            start_line,
+            line,
+            body: "Why?".into(),
+        }
+    }
+
+    #[test]
+    fn hunk_headers_parse_with_and_without_counts() {
         assert_eq!(
-            discussion_body(&comment, &diff_refs),
+            parse_hunk_header("@@ -246,6 +246,8 @@ uv run"),
+            Some(Hunk {
+                old_start: 246,
+                old_len: 6,
+                new_start: 246,
+                new_len: 8
+            })
+        );
+        assert_eq!(
+            parse_hunk_header("@@ -1 +1,2 @@"),
+            Some(Hunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 2
+            })
+        );
+        assert_eq!(parse_hunk_header("+++ b/x"), None);
+    }
+
+    #[test]
+    fn diff_file_tells_added_lines_from_unchanged_ones() {
+        let diff = parse_diff_file(README_DIFF);
+        assert_eq!(diff.old_path.as_deref(), Some("docs/README.md"));
+        // 38 context, 39 and 40 added, 41 and 42 context; nothing beyond.
+        assert_eq!(
+            diff.lines[&38],
+            DiffLine {
+                old_line: Some(38),
+                old_position: 38
+            }
+        );
+        assert_eq!(
+            diff.lines[&39],
+            DiffLine {
+                old_line: None,
+                old_position: 40
+            }
+        );
+        assert_eq!(
+            diff.lines[&42],
+            DiffLine {
+                old_line: Some(41),
+                old_position: 41
+            }
+        );
+        assert!(!diff.lines.contains_key(&43));
+    }
+
+    #[test]
+    fn lines_map_onto_the_head_commit_around_local_changes() {
+        // On disk, two lines were added at 10 and one removed at 20 since head.
+        let hunks = parse_hunks("@@ -9,0 +10,2 @@\n+a\n+b\n@@ -20 +21,0 @@\n-c\n");
+        assert_eq!(line_in_head(&hunks, 5), Some(5));
+        assert_eq!(line_in_head(&hunks, 10), None);
+        assert_eq!(line_in_head(&hunks, 11), None);
+        assert_eq!(line_in_head(&hunks, 12), Some(10));
+        assert_eq!(line_in_head(&hunks, 30), Some(29));
+        assert_eq!(line_in_head(&[], 318), Some(318));
+    }
+
+    #[test]
+    fn a_comment_on_an_added_line_goes_to_the_new_side() {
+        let body = file(&[]).place(&comment(39, 39), &refs()).unwrap();
+        assert_eq!(
+            body,
             json!({
-                "body": "Why not reuse the hunk key?",
+                "body": "Why?",
                 "position": {
                     "position_type": "text",
                     "base_sha": "b",
                     "head_sha": "h",
                     "start_sha": "s",
-                    "new_path": "src/loop.rs",
-                    "old_path": "src/loop.rs",
-                    "new_line": 41,
+                    "new_path": "docs/README.md",
+                    "old_path": "docs/README.md",
+                    "new_line": 39,
                 }
             })
         );
     }
 
     #[test]
-    fn discussion_body_spans_a_multi_line_comment() {
-        let comment = GitLabComment {
-            id: 7,
-            path: "src/loop.rs".into(),
-            start_line: 40,
-            line: 42,
-            body: "This whole loop.".into(),
-        };
-        let diff_refs = DiffRefs {
-            base_sha: "b".into(),
-            head_sha: "h".into(),
-            start_sha: "s".into(),
-        };
+    fn a_comment_on_an_unchanged_line_carries_both_sides() {
+        let body = file(&[]).place(&comment(41, 41), &refs()).unwrap();
+        assert_eq!(body["position"]["new_line"], 41);
+        assert_eq!(body["position"]["old_line"], 40);
+    }
 
-        let body = discussion_body(&comment, &diff_refs);
-
-        assert_eq!(body["position"]["new_line"], 42);
-        let path_hash = "c494c1745f5fe1910594a89a8bd187439f7a6019";
+    #[test]
+    fn a_multi_line_comment_spans_with_gitlab_line_codes() {
+        let body = file(&[]).place(&comment(38, 40), &refs()).unwrap();
+        let path_hash = format!("{:x}", Sha1::digest(b"docs/README.md"));
         assert_eq!(
             body["position"]["line_range"],
             json!({
                 "start": {
+                    "line_code": format!("{path_hash}_38_38"),
+                    "type": null,
+                    "old_line": 38,
+                    "new_line": 38,
+                },
+                "end": {
                     "line_code": format!("{path_hash}_40_40"),
                     "type": "new",
                     "old_line": null,
                     "new_line": 40,
                 },
-                "end": {
-                    "line_code": format!("{path_hash}_42_42"),
-                    "type": "new",
-                    "old_line": null,
-                    "new_line": 42,
-                },
             })
         );
+    }
+
+    #[test]
+    fn a_comment_off_the_diff_or_on_local_only_lines_says_why() {
+        let outside = file(&[]).place(&comment(100, 100), &refs()).unwrap_err();
+        assert!(outside.contains("docs/README.md:100"), "{outside}");
+        assert!(
+            outside.contains("outside the merge request's diff"),
+            "{outside}"
+        );
+
+        let local_only = parse_hunks("@@ -38,0 +39,2 @@\n+x\n+y\n");
+        let unpushed = file(&local_only)
+            .place(&comment(39, 39), &refs())
+            .unwrap_err();
+        assert!(
+            unpushed.contains("not in the merge request's head commit h"),
+            "{unpushed}"
+        );
+
+        // A line after the local change maps back and is still placed.
+        let shifted = file(&local_only).place(&comment(44, 44), &refs()).unwrap();
+        assert_eq!(shifted["position"]["new_line"], 42);
     }
 
     #[test]
